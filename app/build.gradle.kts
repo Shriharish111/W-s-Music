@@ -1,0 +1,80 @@
+﻿import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+
+plugins {
+    kotlin("jvm")
+    kotlin("plugin.compose")
+    id("org.jetbrains.compose")
+}
+kotlin { jvmToolchain(21) }
+
+dependencies {
+    implementation(project(":innertube"))
+    implementation(project(":librarydb"))
+    implementation(project(":lrclib"))
+    implementation(project(":kugou"))
+    implementation(project(":betterlyrics"))
+    implementation(project(":simpmusic"))
+    implementation(project(":youlyplus"))
+    implementation("com.atilika.kuromoji:kuromoji-ipadic:0.9.0")
+    implementation("com.github.promeG:tinypinyin:2.0.3")
+    implementation("com.github.MetrolistGroup.innertubex:innertubex:0.7.2")
+    implementation("io.ktor:ktor-client-okhttp:3.6.0")
+    implementation("io.ktor:ktor-client-content-negotiation:3.6.0")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.6.0")
+    implementation(compose.desktop.currentOs)
+    implementation(compose.material3)
+    implementation("org.jetbrains.compose.material:material-icons-extended:1.7.3")
+    implementation("net.java.dev.jna:jna-platform:5.14.0") // dark Windows title bar
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
+    // JavaFX Media for audio playback (AAC/m4a), no external player needed
+    val fx = "21.0.5"
+    val os = org.gradle.internal.os.OperatingSystem.current()
+    val plat = when { os.isWindows -> "win"; os.isMacOsX -> "mac"; else -> "linux" }
+    for (m in listOf("base", "graphics", "media")) implementation("org.openjfx:javafx-$m:$fx:$plat")
+}
+
+compose.desktop {
+    application {
+        mainClass = "echopc.MainKt"
+        nativeDistributions {
+            targetFormats(TargetFormat.Msi, TargetFormat.Exe)
+            packageName = "WsMusic"
+            packageVersion = "1.0.0"
+            includeAllModules = true // keeps TLS (jdk.crypto.ec), java.net.http, sql etc. in the bundled runtime
+            description = "W's MUSIC"
+            vendor = "W"
+            windows {
+                menuGroup = "W's MUSIC"
+                shortcut = true
+                iconFile.set(project.file("icon.ico"))
+            }
+        }
+        jvmArgs += listOf(
+            "-Xms128m", "-Xmx768m", "-XX:+UseG1GC", "-XX:MaxGCPauseMillis=40",
+            "-Djava.net.preferIPv4Stack=true", // stream URLs are tied to the IP family; IPv6 timeouts made songs fail to start
+            "-Dskiko.renderApi=OPENGL", // skips a slow, failing DirectX 12 attempt on some PCs (falls back to software if GL is missing)
+        )
+    }
+}
+
+tasks.register<JavaExec>("smoke") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set((project.findProperty("main") as String?) ?: "echopc.SmokeKt")
+    jvmArgs("-Djava.net.preferIPv4Stack=true")
+    args = (project.findProperty("q") as String?)?.let { listOf(it) } ?: listOf(project.projectDir.absolutePath)
+}
+
+dependencies {
+    testImplementation(compose.desktop.uiTestJUnit4)
+    testImplementation("junit:junit:4.13.2")
+    testImplementation(kotlin("test"))
+}
+
+tasks.withType<Test> {
+    testLogging { events("passed", "failed", "skipped"); showStandardStreams = true; exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
+}
+
+
+
+
+
