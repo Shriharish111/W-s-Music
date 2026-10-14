@@ -79,9 +79,10 @@ private val WsTypography = Typography(
 @Composable
 fun WsTheme(accent: Accent, content: @Composable () -> Unit) {
     // Cross-fade the accent when the song (and so the album art) changes.
-    val primary by animateColorAsState(accent.primary, tween(700))
-    val secondary by animateColorAsState(accent.secondary, tween(700))
-    val animated = Accent(primary, secondary)
+    // The accent switches instantly with the song; animating it recomposed the whole window for ~40 frames.
+    val primary = accent.primary
+    val secondary = accent.secondary
+    val animated = accent
     val scheme = darkColorScheme(
         primary = primary,
         onPrimary = Color.White,

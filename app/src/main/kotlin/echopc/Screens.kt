@@ -80,7 +80,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.focusRequester
@@ -128,7 +128,7 @@ fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
             Row(Modifier.weight(1f).fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 12.dp)) {
                 NavRail(c)
                 Box(Modifier.weight(1f).fillMaxHeight().padding(horizontal = 12.dp)) {
-                    Crossfade(c.section, animationSpec = tween(220), label = "section") { s ->
+                    run { val s = c.section
                         when (s) {
                             Section.HOME -> HomeScreen(c)
                             Section.SEARCH -> SearchScreen(c)
@@ -136,23 +136,15 @@ fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
                         }
                     }
                 }
-                AnimatedVisibility(
-                    c.panelOpen,
-                    enter = slideInHorizontally(tween(260)) { it / 3 } + fadeIn(tween(260)),
-                    exit = slideOutHorizontally(tween(200)) { it / 3 } + fadeOut(tween(200)),
-                ) { SidePanel(c) }
+                if (c.panelOpen) SidePanel(c)
             }
             PlayerBar(c)
         }
         // Toast
         Box(Modifier.align(Alignment.TopCenter).padding(top = 18.dp)) {
-            AnimatedVisibility(
-                c.toast != null,
-                enter = slideInVertically(tween(200)) { -it } + fadeIn(tween(200)),
-                exit = slideOutVertically(tween(200)) { -it } + fadeOut(tween(200)),
-            ) {
+            c.toast?.let { message ->
                 Text(
-                    c.toast.orEmpty(),
+                    message,
                     Modifier.panel(14.dp, Ws.surfaceTop).padding(horizontal = 18.dp, vertical = 10.dp),
                     style = MaterialTheme.typography.labelLarge, color = Ws.text,
                 )
@@ -165,10 +157,12 @@ fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
 }
 
 /** Two big blurred colour pools in the background that follow the album-art accent. */
-private fun Modifier.drawBackdrop(accent: Accent): Modifier = this.drawBehind {
+private fun Modifier.drawBackdrop(accent: Accent): Modifier = this.drawWithCache {
+    // Brushes are built once per size/accent change, not on every frame.
     val w = size.width; val h = size.height
-    drawRect(Brush.radialGradient(listOf(accent.primary.copy(alpha = 0.20f), Color.Transparent), androidx.compose.ui.geometry.Offset(w * 0.18f, h * 0.05f), w * 0.55f))
-    drawRect(Brush.radialGradient(listOf(accent.secondary.copy(alpha = 0.13f), Color.Transparent), androidx.compose.ui.geometry.Offset(w * 0.95f, h * 0.95f), w * 0.5f))
+    val a = Brush.radialGradient(listOf(accent.primary.copy(alpha = 0.20f), Color.Transparent), androidx.compose.ui.geometry.Offset(w * 0.18f, h * 0.05f), w * 0.55f)
+    val b = Brush.radialGradient(listOf(accent.secondary.copy(alpha = 0.13f), Color.Transparent), androidx.compose.ui.geometry.Offset(w * 0.95f, h * 0.95f), w * 0.5f)
+    onDrawBehind { drawRect(a); drawRect(b) }
 }
 
 // =====================================================================================
@@ -395,7 +389,7 @@ private fun LibraryScreen(c: Controller, onPickAndroidFile: () -> Unit) {
             GhostButton("Import from Android", onPickAndroidFile, icon = Icons.Rounded.FileUpload)
         }
         SegmentedTabs(listOf("Liked", "Songs", "Playlists", "History"), c.libraryTab, { c.libraryTab = it; c.openPlaylistId = null }, Modifier.width(460.dp))
-        Crossfade(c.libraryTab, Modifier.weight(1f), animationSpec = tween(180), label = "libtab") { tab ->
+        Box(Modifier.weight(1f)) { val tab = c.libraryTab
             when (tab) {
                 0 -> LikedTab(c)
                 1 -> SongsTab(c)
@@ -524,7 +518,7 @@ private fun PlaylistDetail(c: Controller, id: String) {
 private fun SidePanel(c: Controller) {
     Column(Modifier.padding(start = 0.dp).width(390.dp).fillMaxHeight().panel(22.dp).padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         SegmentedTabs(listOf("Queue", "Lyrics"), c.panelTab.ordinal, { c.panelTab = PanelTab.entries[it] })
-        Crossfade(c.panelTab, Modifier.weight(1f), animationSpec = tween(160), label = "panel") { tab ->
+        Box(Modifier.weight(1f)) { val tab = c.panelTab
             if (tab == PanelTab.QUEUE) QueuePanel(c) else LyricsPanel(c)
         }
     }
@@ -534,7 +528,7 @@ private fun SidePanel(c: Controller) {
 private fun QueuePanel(c: Controller) {
     val q = c.queue
     val listState = rememberLazyListState()
-    LaunchedEffect(q.index) { if (q.index >= 0 && q.items.isNotEmpty()) listState.animateScrollToItem((q.index - 1).coerceAtLeast(0)) }
+    LaunchedEffect(q.index) { if (q.index >= 0 && q.items.isNotEmpty()) listState.scrollToItem((q.index - 1).coerceAtLeast(0)) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Eyebrow("${q.items.size} in queue", Modifier.weight(1f))
@@ -593,7 +587,7 @@ private fun LoadedLyrics(c: Controller, state: LyricsUiState.Loaded) {
     // Only recomposes when the highlighted line changes, not on every position tick.
     val currentIndex by remember(state) { derivedStateOf { if (state.synced) LyricsUtils.findCurrentLineIndex(state.lines, c.positionMs) else -1 } }
     val listState = rememberLazyListState()
-    LaunchedEffect(currentIndex) { if (currentIndex >= 0) listState.animateScrollToItem((currentIndex - 2).coerceAtLeast(0)) }
+    LaunchedEffect(currentIndex) { if (currentIndex >= 0) listState.scrollToItem((currentIndex - 2).coerceAtLeast(0)) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -612,8 +606,8 @@ private fun LoadedLyrics(c: Controller, state: LyricsUiState.Loaded) {
 private fun LyricLine(c: Controller, line: LyricsEntry, romanized: String?, active: Boolean, past: Boolean, seekable: Boolean) {
     val accent = LocalAccent.current
     val target = when { active -> 1f; past -> 0.42f; else -> 0.62f }
-    val alpha by androidx.compose.animation.core.animateFloatAsState(target, tween(250))
-    val size by androidx.compose.animation.core.animateFloatAsState(if (active) 21f else 16f, tween(250))
+    val alpha = target
+    val size = if (active) 21f else 16f
     HoverRow({ if (seekable) c.seek(line.time) }, Modifier.padding(horizontal = 2.dp)) { _ ->
         Column(Modifier.padding(horizontal = 10.dp, vertical = 4.dp)) {
             val words = line.words

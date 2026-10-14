@@ -44,10 +44,15 @@ fun settingsFile(): File {
 fun main() = application {
     Trace.mark("main entered")
     val scope = remember { kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default) }
-    val library = remember { LibraryRepository(LibraryDatabase.open()).also { Trace.mark("database opened") } }
+    // WSMUSIC_BENCH: benchmark mode (temporary database, settings not saved, muted autoplay of one search result).
+    val bench = remember { System.getenv("WSMUSIC_BENCH") != null }
+    val library = remember {
+        val file = if (bench) File.createTempFile("wsmusic-bench", ".db").also { it.delete(); it.deleteOnExit() } else LibraryDatabase.defaultFile()
+        LibraryRepository(LibraryDatabase.open(file)).also { Trace.mark("database opened") }
+    }
     val controller = remember {
         LyricsRepository.store = library
-        Controller(scope, library, settingsFile()) { onState, onEnded -> DesktopPlayer(onState, onEnded) }.also { Trace.mark("controller created") }
+        Controller(scope, library, if (bench) null else settingsFile()) { onState, onEnded -> DesktopPlayer(onState, onEnded) }.also { Trace.mark("controller created") }
     }
     val icon = remember { BitmapPainter(renderAppIcon(256).toComposeImageBitmap()) }
     // Fit the window to the usable screen (minus taskbar) so small laptop displays are not overrun.
@@ -82,6 +87,13 @@ fun main() = application {
             applyDarkTitleBar(window)
             Trace.mark("title bar styled")
             controller.warmUp()
+            if (bench) {
+                controller.changeVolume(0f)
+                controller.search("daft punk get lucky")
+                while (controller.results.isEmpty()) kotlinx.coroutines.delay(500)
+                controller.playFromList(controller.results, 0)
+                Trace.mark("bench: playback requested")
+            }
         }
         WsTheme(controller.accent) {
             AppContent(controller, onPickAndroidFile = {

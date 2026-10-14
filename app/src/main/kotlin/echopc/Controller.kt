@@ -407,8 +407,10 @@ class Controller(
     /** Warms up the stream resolver so the first song starts sooner. */
     fun warmUp() {
         scope.launch(Dispatchers.IO) {
+            runCatching { if (YouTube.visitorData == null) YouTube.visitorData().onSuccess { YouTube.visitorData = it } }
+            loadHome() // the feed no longer waits for the stream resolver warm-up
+            delay(4_000) // keep the first seconds light; this only shortens the first song's start
             InnerTubeXStream.prewarm()
-            loadHome() // also warms up TLS, connection pooling and the JSON parser
         }
     }
 

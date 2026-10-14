@@ -1,4 +1,4 @@
-﻿import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 
 plugins {
     kotlin("jvm")
@@ -50,7 +50,10 @@ compose.desktop {
             }
         }
         jvmArgs += listOf(
-            "-Xms128m", "-Xmx768m", "-XX:+UseG1GC", "-XX:MaxGCPauseMillis=40",
+            // Small, quiet JVM: serial GC (no extra GC threads / 40+ MB of G1 bookkeeping), a small heap that
+            // shrinks after use, and the light JIT tier (about half the compile CPU, less code cache).
+            "-XX:+UseSerialGC", "-Xms24m", "-Xmx512m", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25",
+            "-XX:TieredStopAtLevel=1", "-XX:ReservedCodeCacheSize=48m", "-Xss512k",
             "-Djava.net.preferIPv4Stack=true", // stream URLs are tied to the IP family; IPv6 timeouts made songs fail to start
             "-Dskiko.renderApi=OPENGL", // skips a slow, failing DirectX 12 attempt on some PCs (falls back to software if GL is missing)
         )

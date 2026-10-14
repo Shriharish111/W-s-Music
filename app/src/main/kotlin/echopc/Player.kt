@@ -142,11 +142,15 @@ class DesktopPlayer(
     private var state = PlayerState()
     private var volume = 0.8
 
-    // JavaFX (audio) takes seconds to start. Do it off the UI thread so the window opens first;
-    // playback waits on this latch, and by the time anyone presses play it is long done.
+    // JavaFX (audio) costs memory, threads and a second or two of CPU, so it is only started the first
+    // time something is played (in parallel with the stream download), never at app launch.
     private val fxReady = java.util.concurrent.CountDownLatch(1)
+    private val fxStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    init {
+    private fun ensureFx() {
+        if (!fxStarted.compareAndSet(false, true)) return
+        // Audio only: skip creating a Direct3D rendering pipeline we would never use.
+        System.setProperty("prism.order", "sw")
         Thread({
             try {
                 Platform.startup {
@@ -169,6 +173,7 @@ class DesktopPlayer(
 
     /** Plays [videoId] now and starts fetching [nextVideoId] in the background. */
     override fun play(videoId: String, nextVideoId: String?) {
+        ensureFx()
         val gen = ++generation
         playJob?.cancel()
         disposePlayer()
@@ -207,7 +212,7 @@ class DesktopPlayer(
                 player.currentTimeProperty().addListener { _, _, t ->
                     if (gen == generation) {
                         val ms = t.toMillis().toLong()
-                        if (kotlin.math.abs(ms - state.positionMs) >= 120) update { copy(positionMs = ms) }
+                        if (kotlin.math.abs(ms - state.positionMs) >= 200) update { copy(positionMs = ms) }
                     }
                 }
                 player.setOnEndOfMedia {

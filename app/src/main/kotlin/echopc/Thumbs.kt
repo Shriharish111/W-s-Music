@@ -29,17 +29,29 @@ import javax.imageio.ImageIO
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-class LoadedThumb(val bitmap: ImageBitmap, val dominant: Color)
+class LoadedThumb(val bitmap: ImageBitmap, val dominant: Color, val bytes: Int)
 
 /**
  * Album-art loader: asks the server for a small image (instead of 544px for a 44px row), decodes
  * off the UI thread, keeps a bounded LRU cache and works out a vivid dominant colour for theming.
  */
 object ThumbCache {
-    private val cache: MutableMap<String, LoadedThumb> =
-        Collections.synchronizedMap(object : LinkedHashMap<String, LoadedThumb>(256, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, LoadedThumb>?) = size > 400
-        })
+    // Bounded by memory (not by count): pictures are kept in an LRU until they add up to ~40 MB.
+    private const val MAX_BYTES = 40L * 1024 * 1024
+    private val cache = LinkedHashMap<String, LoadedThumb>(128, 0.75f, true)
+    private var cachedBytes = 0L
+
+    private fun get(key: String): LoadedThumb? = synchronized(cache) { cache[key] }
+
+    private fun put(key: String, thumb: LoadedThumb) = synchronized(cache) {
+        cache.put(key, thumb)?.let { cachedBytes -= it.bytes }
+        cachedBytes += thumb.bytes
+        val it = cache.entries.iterator()
+        while (cachedBytes > MAX_BYTES && it.hasNext()) {
+            val e = it.next()
+            if (e.key != key) { cachedBytes -= e.value.bytes; it.remove() }
+        }
+    }
     private val failed: MutableSet<String> = Collections.synchronizedSet(HashSet())
     private val sizeRegex = Regex("=w\\d+-h\\d+[^/?]*$")
 
@@ -47,26 +59,26 @@ object ThumbCache {
     fun sized(url: String, px: Int): String =
         if (sizeRegex.containsMatchIn(url)) url.replace(sizeRegex, "=w$px-h$px-l90-rj") else url
 
-    fun peek(url: String, px: Int): LoadedThumb? = cache[sized(url, px)]
+    fun peek(url: String, px: Int): LoadedThumb? = get(sized(url, px))
 
     suspend fun load(url: String, px: Int): LoadedThumb? {
         val key = sized(url, px)
-        cache[key]?.let { return it }
+        get(key)?.let { return it }
         if (key in failed) return null
         return withContext(Dispatchers.IO) {
             runCatching {
                 val src = ImageIO.read(URI.create(key).toURL()) ?: return@runCatching null
                 val fitted = fit(src, px)
-                LoadedThumb(fitted.toComposeImageBitmap(), dominantColor(fitted)).also { cache[key] = it }
+                LoadedThumb(fitted.toComposeImageBitmap(), dominantColor(fitted), fitted.width * fitted.height * 4).also { put(key, it) }
             }.getOrNull().also { if (it == null) failed += key }
         }
     }
 
     private fun fit(src: BufferedImage, px: Int): BufferedImage {
-        // Square-crop, then scale down to at most 2x the display size (sharp on HiDPI, small in memory).
+        // Square-crop, then scale down to the pixel size it will actually be shown at.
         val side = minOf(src.width, src.height)
         val crop = src.getSubimage((src.width - side) / 2, (src.height - side) / 2, side, side)
-        val target = minOf(side, px * 2)
+        val target = minOf(side, px)
         if (target == side) return crop
         val out = BufferedImage(target, target, BufferedImage.TYPE_INT_ARGB)
         out.createGraphics().apply {
@@ -120,7 +132,8 @@ private fun Placeholder(seed: String, modifier: Modifier = Modifier) {
 
 @Composable
 fun Thumb(url: String?, size: Dp, modifier: Modifier = Modifier, corner: Dp = 10.dp, seed: String = url.orEmpty()) {
-    val px = (size.value.toInt() * 2).coerceIn(64, 600)
+    val density = androidx.compose.ui.platform.LocalDensity.current.density
+    val px = (size.value * density).toInt().coerceIn(48, 480) // real on-screen pixels, not 2x
     val loaded by produceState<LoadedThumb?>(url?.takeIf { it.isNotBlank() }?.let { ThumbCache.peek(it, px) }, url) {
         value = if (url.isNullOrBlank()) null else ThumbCache.peek(url, px) ?: ThumbCache.load(url, px)
     }

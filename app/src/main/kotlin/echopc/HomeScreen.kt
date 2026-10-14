@@ -78,7 +78,7 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun HomeScreen(c: Controller) {
-    Crossfade(c.detail, animationSpec = tween(200), label = "detail") { d ->
+    run { val d = c.detail
         if (d == null) HomeFeed(c) else DetailScreen(c, d)
     }
 }
@@ -102,12 +102,9 @@ fun MediaCard(
     val accent = LocalAccent.current
     val source = remember { MutableInteractionSource() }
     val hovered by source.collectIsHoveredAsState()
-    val scale by animateFloatAsState(if (hovered) 1.03f else 1f, tween(160))
-    val reveal by animateFloatAsState(if (hovered) 1f else 0f, tween(160))
     val cover = size - 20.dp
     Column(
         modifier.width(size)
-            .graphicsLayer { scaleX = scale; scaleY = scale }
             .clip(RoundedCornerShape(18.dp))
             .background(if (hovered) Color.White.copy(alpha = 0.07f) else Color.Transparent)
             .hoverable(source).clickable(source, null, onClick = onClick).handCursor()
@@ -116,12 +113,10 @@ fun MediaCard(
     ) {
         Box(Modifier.size(cover)) {
             Thumb(thumb, cover, corner = if (round) cover / 2 else 14.dp, seed = title)
-            if (onPlay != null) {
+            if (onPlay != null && hovered) {
                 Box(
                     Modifier.align(Alignment.BottomEnd).padding(8.dp)
-                        .graphicsLayer { alpha = reveal; translationY = (1f - reveal) * 14f }
                         .size(44.dp)
-                        .shadow(10.dp, CircleShape, ambientColor = accent.primary, spotColor = accent.primary)
                         .clip(CircleShape).background(Brush.linearGradient(listOf(accent.primary, accent.secondary)))
                         .clickable(onClick = onPlay).handCursor(),
                     contentAlignment = Alignment.Center,
@@ -241,7 +236,7 @@ private fun HomeFeed(c: Controller) {
         if (c.moods.isNotEmpty()) item("moods") { MoodGrid(c) }
         if (c.homeMore != null) item("more") {
             LaunchedEffect(c.homeMore) { c.loadMoreHome() } // only composed near the bottom: infinite scroll
-            Box(Modifier.fillMaxWidth().height(60.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(26.dp), color = LocalAccent.current.primary, strokeWidth = 2.5.dp) }
+            Box(Modifier.fillMaxWidth().height(60.dp), contentAlignment = Alignment.Center) { Text("Loading more…", style = MaterialTheme.typography.bodySmall, color = Ws.faint) }
         }
     }
 }
@@ -275,7 +270,7 @@ private fun QuickTileView(tile: QuickTile, modifier: Modifier) {
     val accent = LocalAccent.current
     val source = remember { MutableInteractionSource() }
     val hovered by source.collectIsHoveredAsState()
-    val reveal by animateFloatAsState(if (hovered) 1f else 0f, tween(150))
+    val reveal = if (hovered) 1f else 0f
     val shape = RoundedCornerShape(14.dp)
     Row(
         modifier.height(64.dp).clip(shape).background(if (hovered) Ws.surfaceTop else Ws.surfaceHi)
@@ -332,8 +327,7 @@ private fun MoodTile(item: MoodAndGenres.Item, onClick: () -> Unit, modifier: Mo
 
 @Composable
 private fun SkeletonShelf() {
-    val t = rememberInfiniteTransition(label = "skeleton")
-    val a = t.animateFloat(0.25f, 0.6f, infiniteRepeatable(tween(850), RepeatMode.Reverse), label = "a")
+    val a = remember { androidx.compose.runtime.mutableStateOf(0.4f) } // static placeholder (no pulsing animation)
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Box(Modifier.width(220.dp).height(22.dp).graphicsLayer { alpha = a.value }.clip(RoundedCornerShape(8.dp)).background(Ws.surfaceTop))
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -362,7 +356,6 @@ private fun DetailScreen(c: Controller, d: DetailUi) {
         when (d) {
             is DetailUi.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    CircularProgressIndicator(color = accent.primary)
                     Text("Opening ${d.title}…", style = MaterialTheme.typography.bodyMedium, color = Ws.muted)
                 }
             }

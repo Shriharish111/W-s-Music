@@ -52,7 +52,10 @@ object LyricsRepository {
 
     @Volatile var store: LibraryRepository? = null
 
-    private val cache = ConcurrentHashMap<String, LyricsUiState>()
+    // Small LRU (the database keeps everything long-term).
+    private val cache: MutableMap<String, LyricsUiState> = java.util.Collections.synchronizedMap(object : LinkedHashMap<String, LyricsUiState>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, LyricsUiState>?) = size > 30
+    })
     private const val PROVIDER_TIMEOUT_MS = 10_000L
 
     private fun fromRaw(provider: String, raw: String): LyricsUiState.Loaded? {
