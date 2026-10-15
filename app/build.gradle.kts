@@ -24,6 +24,7 @@ dependencies {
     implementation(compose.desktop.currentOs)
     implementation(compose.material3)
     implementation("org.jetbrains.compose.material:material-icons-extended:1.7.3")
+    implementation("com.tianscar.javasound:jaad:0.9.4") // pure-Java AAC decoder for the compatible audio engine
     implementation("net.java.dev.jna:jna-platform:5.14.0") // dark Windows title bar
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
     // JavaFX Media for audio playback (AAC/m4a), no external player needed
@@ -46,6 +47,7 @@ compose.desktop {
             windows {
                 menuGroup = "W's MUSIC"
                 shortcut = true
+                perUserInstall = true // installs into the user's profile: no administrator rights needed (school/work PCs)
                 iconFile.set(project.file("icon.ico"))
             }
         }
@@ -55,9 +57,17 @@ compose.desktop {
             "-XX:+UseSerialGC", "-Xms24m", "-Xmx512m", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25",
             "-XX:TieredStopAtLevel=1", "-XX:ReservedCodeCacheSize=48m", "-Xss512k",
             "-Djava.net.preferIPv4Stack=true", // stream URLs are tied to the IP family; IPv6 timeouts made songs fail to start
-            "-Dskiko.renderApi=OPENGL", // skips a slow, failing DirectX 12 attempt on some PCs (falls back to software if GL is missing)
+            // skiko.renderApi is chosen at startup by Device.configure(): OpenGL normally, CPU rendering after a failed start.
         )
     }
+}
+
+// Portable build: unzip anywhere and run WsMusic.exe (no installer, no admin rights). `gradlew :app:portableZip`
+tasks.register<Zip>("portableZip") {
+    dependsOn("createDistributable")
+    from(layout.buildDirectory.dir("compose/binaries/main/app"))
+    archiveFileName.set("WsMusic-portable.zip")
+    destinationDirectory.set(layout.buildDirectory.dir("compose/binaries/main"))
 }
 
 tasks.register<JavaExec>("smoke") {

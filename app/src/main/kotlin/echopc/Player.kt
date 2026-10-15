@@ -133,9 +133,11 @@ interface PlayerEngine {
 class DesktopPlayer(
     private val onState: (PlayerState) -> Unit,
     private val onEnded: () -> Unit = {},
+    private val loader: AudioLoader = AudioLoader(),
+    /** Called (instead of showing an error) when JavaFX itself cannot start or open a track. */
+    private val onEngineFailure: ((String) -> Unit)? = null,
 ) : PlayerEngine {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val loader = AudioLoader()
     private var mediaPlayer: MediaPlayer? = null
     private var playJob: Job? = null
     private var generation = 0
@@ -146,6 +148,13 @@ class DesktopPlayer(
     // time something is played (in parallel with the stream download), never at app launch.
     private val fxReady = java.util.concurrent.CountDownLatch(1)
     private val fxStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var fxUsable = true
+
+    private fun engineFailed(gen: Int, reason: String) {
+        if (gen != generation) return
+        val handler = onEngineFailure
+        if (handler != null) handler(reason) else update { PlayerState(error = reason) }
+    }
 
     private fun ensureFx() {
         if (!fxStarted.compareAndSet(false, true)) return
@@ -160,7 +169,9 @@ class DesktopPlayer(
             } catch (_: IllegalStateException) {
                 Platform.setImplicitExit(false) // toolkit was already running
                 fxReady.countDown()
-            } catch (_: Throwable) {
+            } catch (e: Throwable) {
+                Device.log("JavaFX startup failed: ${e.stackTraceToString().take(600)}")
+                fxUsable = false
                 fxReady.countDown()
             }
         }, "javafx-init").apply { isDaemon = true; start() }
@@ -184,7 +195,8 @@ class DesktopPlayer(
             try {
                 val file = current.await()
                 if (gen != generation) return@launch
-                withContext(Dispatchers.IO) { fxReady.await(30, java.util.concurrent.TimeUnit.SECONDS) }
+                val ready = withContext(Dispatchers.IO) { fxReady.await(30, java.util.concurrent.TimeUnit.SECONDS) }
+                if (!ready || !fxUsable) { engineFailed(gen, "JavaFX toolkit did not start"); return@launch }
                 startPlayback(file, gen)
                 // Current track is ready: now warm up the next one.
                 if (nextVideoId != null && gen == generation) loader.load(nextVideoId)
@@ -222,11 +234,17 @@ class DesktopPlayer(
                     }
                 }
                 player.setOnError {
-                    if (gen == generation) update { PlayerState(error = player.error?.message ?: "Playback error") }
+                    engineFailed(gen, player.error?.message ?: "Playback error")
                     if (cont.isActive) cont.resume(Unit)
                 }
+                // If the media engine neither plays nor reports an error (missing codecs), give up after a while.
+                scope.launch {
+                    kotlinx.coroutines.delay(20_000)
+                    if (gen == generation && state.loading) engineFailed(gen, "JavaFX media did not become ready")
+                }
             } catch (e: Throwable) {
-                if (gen == generation) update { PlayerState(error = e.message ?: e.toString()) }
+                Device.log("JavaFX media failed: ${e.stackTraceToString().take(600)}")
+                engineFailed(gen, e.message ?: e.toString())
                 if (cont.isActive) cont.resume(Unit)
             }
         }
@@ -258,10 +276,15 @@ class DesktopPlayer(
         if (p != null) Platform.runLater { runCatching { p.stop(); p.dispose() } }
     }
 
-    override fun stop() {
+    /** Stops playback without discarding downloaded files (used when switching engines). */
+    fun release() {
         generation++
         playJob?.cancel()
         disposePlayer()
+    }
+
+    override fun stop() {
+        release()
         loader.retainOnly(emptySet())
         update { PlayerState() }
     }
