@@ -93,6 +93,7 @@ dependencies {
 
 tasks.withType<Test> {
     systemProperty("wsmusic.nolog", "1")
+    forkEvery = 1 // each test class in its own JVM: UI tests share global state (Skiko, caches) and were disturbing each other
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true; exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
 }
 

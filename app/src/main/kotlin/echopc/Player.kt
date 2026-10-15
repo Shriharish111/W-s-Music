@@ -56,7 +56,8 @@ class AudioLoader(
                 var lastError: Throwable? = null
                 val skip = mutableSetOf<String>()
                 var protectedByYouTube = false // YouTube asked for attestation: every client fails the same way for a while
-                repeat(MAX_ATTEMPTS) { attempt ->
+                var attempt = 0
+                while (attempt < (if (protectedByYouTube) MAX_ATTEMPTS_BLOCKED else MAX_ATTEMPTS)) {
                     try {
                         // 1: normal. 2: avoid the client that just failed. 3-4: no SABR (plain ranged URLs), then any client again.
                         // After an attestation block none of that helps, so keep the normal way and wait instead.
@@ -71,15 +72,17 @@ class AudioLoader(
                         val blocked = e.message?.contains("attestation", ignoreCase = true) == true
                         if (blocked) protectedByYouTube = true else (e as? StreamFailure)?.client?.let { skip += it }
                         val client = (e as? StreamFailure)?.client ?: "unknown client"
-                        val msg = "Stream $videoId attempt ${attempt + 1}/$MAX_ATTEMPTS failed via $client: ${e.message?.take(200)}"
+                        val limit = if (protectedByYouTube) MAX_ATTEMPTS_BLOCKED else MAX_ATTEMPTS
+                        val msg = "Stream $videoId attempt ${attempt + 1}/$limit failed via $client: ${e.message?.take(200)}"
                         println("[loader] $msg")
                         Device.log(msg)
-                        // An attestation block clears by itself after a few seconds: wait longer between tries.
-                        kotlinx.coroutines.delay(retryDelayMs * (attempt + 1) * (if (blocked) 6 else 1))
+                        // An attestation block clears by itself after some seconds: wait 3, 6, 10, 15, 20, 25 s between tries.
+                        kotlinx.coroutines.delay(retryDelayMs * (if (blocked) BLOCK_WAITS[minOf(attempt, BLOCK_WAITS.lastIndex)] else (attempt + 1).toLong()))
                     }
+                    attempt++
                 }
                 cache.remove(videoId)
-                Device.log("Stream $videoId gave up after $MAX_ATTEMPTS attempts.")
+                Device.log("Stream $videoId gave up after $attempt attempts.")
                 throw lastError!!
             }
         }
@@ -147,6 +150,8 @@ class AudioLoader(
 }
 
 private const val MAX_ATTEMPTS = 4
+private const val MAX_ATTEMPTS_BLOCKED = 7 // when YouTube is blocking streams, keep trying for about a minute
+private val BLOCK_WAITS = longArrayOf(6, 12, 20, 30, 40, 50) // in units of the retry delay (500 ms)
 
 /** What the UI needs from a player; lets screenshot/UI tests run without audio. */
 interface PlayerEngine {

@@ -58,6 +58,19 @@ class AudioLoaderRetryTest {
     }
 
     @Test
+    fun anAttestationBlockIsRetriedForAboutAMinuteThenGivenUp() = runBlocking {
+        var tries = 0
+        val loader = AudioLoader(
+            resolver = { _, _, _ -> tries++; stream("VISIONOS") },
+            downloadOverride = { _, _ -> error("SABR stream protection requires attestation (status 2)") },
+            retryDelayMs = 1,
+        )
+        val failure = runCatching { loader.load("vid4").await() }.exceptionOrNull()
+        assertTrue(failure is StreamFailure)
+        assertEquals(7, tries)
+    }
+
+    @Test
     fun laterAttemptsStopUsingSabrAndEventuallyGiveUp() = runBlocking {
         val calls = mutableListOf<Boolean>()
         val loader = AudioLoader(
