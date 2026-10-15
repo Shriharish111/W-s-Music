@@ -60,11 +60,12 @@ class ScreenshotTest {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val c = Controller(scope, repo, null) { _, _ -> FakeEngine() }
 
-        runBlocking {
+        val p1 = runBlocking {
             songs.take(5).forEach { repo.toggleLike(it) }
             val p1 = repo.createPlaylist("Late night drive"); val p2 = repo.createPlaylist("Gym grind"); repo.createPlaylist("Boss fight")
             songs.take(4).forEach { repo.addToPlaylist(p1.id, it) }; songs.drop(3).take(3).forEach { repo.addToPlaylist(p2.id, it) }
             repo.recordPlay(songs[0], 120_000); repo.recordPlay(songs[2], 90_000)
+            p1
         }
 
         // State as if the user searched and is playing the 2nd song.
@@ -102,14 +103,16 @@ class ScreenshotTest {
             File(out, "$name.png").writeBytes(data.bytes)
             println("SHOT $name ${bmp.width}x${bmp.height} -> ${File(out, "$name.png").length()} bytes")
         }
-        c.section = Section.SEARCH
-        c.panelTab = PanelTab.QUEUE; shot("1-search-queue")
-        c.panelTab = PanelTab.LYRICS; shot("2-search-lyrics")
-        c.section = Section.LIBRARY; c.libraryTab = 0; shot("3-library-liked")
-        c.libraryTab = 2; shot("4-library-playlists")
-        c.libraryTab = 3; shot("5-library-history")
-        c.section = Section.SEARCH; c.results = emptyList(); c.query = ""; c.queue = QueueState(); c.playback = PlayerState(); c.positionMs = 0; c.lyrics = LyricsUiState.Idle
-        shot("6-empty-state")
+        c.navigate(Route.Search)
+        c.panelOpen = true; c.panelTab = PanelTab.QUEUE; shot("1-search-queue")
+        c.panelTab = PanelTab.NOW_PLAYING; shot("2-search-now-playing")
+        c.navigate(Route.Lyrics); shot("3-lyrics")
+        c.navigate(Route.Liked); shot("4-liked")
+        c.navigate(Route.LocalPlaylist(p1.id)); shot("5-playlist")
+        c.navigate(Route.History); c.sidebarCollapsed = true; shot("6-history-collapsed")
+        c.sidebarCollapsed = false
+        c.navigate(Route.Search); c.results = emptyList(); c.query = ""; c.queue = QueueState(); c.playback = PlayerState(); c.positionMs = 0; c.lyrics = LyricsUiState.Idle
+        shot("7-empty-state")
         repo.close()
     }
 }

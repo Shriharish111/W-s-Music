@@ -56,8 +56,9 @@ class HomeShotTest {
         val playlist = c.homeSections.flatMap { it.items }.filterIsInstance<PlaylistItem>().first()
         c.openPlaylist(playlist)
         val t1 = System.currentTimeMillis()
-        while (c.detail !is DetailUi.Songs && System.currentTimeMillis() - t1 < 40_000) Thread.sleep(200)
-        println("DETAIL: ${(c.detail as? DetailUi.Songs)?.let { "${it.title} / ${it.songs.size} songs" } ?: c.detail}")
+        fun detail() = (c.route as? Route.Online)?.let { c.details[it.key] }
+        while (detail() !is DetailUi.Songs && System.currentTimeMillis() - t1 < 40_000) Thread.sleep(200)
+        println("DETAIL: ${(detail() as? DetailUi.Songs)?.let { "${it.title} / ${it.songs.size} songs" } ?: detail()}")
         shot("h2-detail")
         repo.close()
     }

@@ -4,6 +4,7 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
@@ -28,10 +29,27 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
-enum class Section { HOME, SEARCH, LIBRARY }
-enum class PanelTab { QUEUE, LYRICS }
+/** A page of the main view. The controller keeps a back stack of these (top bar back/forward). */
+sealed interface Route {
+    data object Home : Route
+    data object Search : Route
+    data object Liked : Route
+    data object LibrarySongs : Route
+    data object History : Route
+    data object Lyrics : Route
+    data class LocalPlaylist(val id: String) : Route
+    /** An online playlist / album / mood page; its content lives in [Controller.details] under [key]. */
+    data class Online(val key: String) : Route
+}
 
-/** What the Home screen shows instead of the feed while a playlist / album / mood page is open. */
+/** What the right-hand panel shows. */
+enum class PanelTab { NOW_PLAYING, QUEUE }
+
+/** Library sidebar width limits in dp (it can also collapse to an icon strip). */
+const val SIDEBAR_MIN = 240f
+const val SIDEBAR_MAX = 440f
+
+/** Content of an online playlist / album / mood page. */
 sealed interface DetailUi {
     val title: String
     data class Loading(override val title: String) : DetailUi
@@ -78,11 +96,17 @@ class Controller(
     engineFactory: (onState: (PlayerState) -> Unit, onEnded: () -> Unit) -> PlayerEngine,
 ) {
     // ---- navigation ----
-    var section by mutableStateOf(Section.HOME)
-    var libraryTab by mutableStateOf(0)
-    var openPlaylistId by mutableStateOf<String?>(null)
+    var backStack by mutableStateOf<List<Route>>(listOf(Route.Home))
+        private set
+    private var forwardStack by mutableStateOf<List<Route>>(emptyList())
+    val route: Route get() = backStack.last()
+    val canGoBack: Boolean get() = backStack.size > 1
+    val canGoForward: Boolean get() = forwardStack.isNotEmpty()
+    val details = mutableStateMapOf<String, DetailUi>()
     var panelOpen by mutableStateOf(true)
-    var panelTab by mutableStateOf(PanelTab.QUEUE)
+    var panelTab by mutableStateOf(PanelTab.NOW_PLAYING)
+    var sidebarWidth by mutableFloatStateOf(300f) // dp
+    var sidebarCollapsed by mutableStateOf(false)
 
     // ---- home feed ----
     var homeSections by mutableStateOf<List<HomePage.Section>>(emptyList())
@@ -94,7 +118,6 @@ class Controller(
     var homeLoadingMore by mutableStateOf(false)
     var newReleases by mutableStateOf<List<AlbumItem>>(emptyList())
     var moods by mutableStateOf<List<MoodAndGenres.Item>>(emptyList())
-    var detail by mutableStateOf<DetailUi?>(null)
 
     // ---- search ----
     var query by mutableStateOf("")
@@ -262,52 +285,75 @@ class Controller(
         }
     }
 
-    fun closeDetail() { detail = null }
+    // ---------------- navigation ----------------
 
-    fun openPlaylist(p: PlaylistItem) {
-        detail = DetailUi.Loading(p.title)
-        scope.launch {
-            YouTube.playlist(p.id)
-                .onSuccess { page ->
-                    val songs = page.songs.toMutableList()
-                    var next = page.songsContinuation ?: page.continuation
-                    var pages = 0
-                    while (next != null && pages < 4) { // long playlists: pull a few more pages
-                        val more = YouTube.playlistContinuation(next).getOrNull() ?: break
-                        songs += more.songs; next = more.continuation; pages++
-                    }
-                    detail = DetailUi.Songs(
-                        page.playlist.title.ifBlank { p.title }, "Playlist",
-                        listOfNotNull(page.playlist.author?.name, "${songs.size} songs").joinToString(" · "),
-                        page.playlist.thumbnail ?: p.thumbnail, songs.distinctBy { it.id },
-                    )
-                }
-                .onFailure { detail = DetailUi.Failed(p.title, it.message ?: "Couldn't open this playlist") }
-        }
+    /** Opens [to] in the main view. Re-opening the current page does nothing. */
+    fun navigate(to: Route) {
+        if (route == to) return
+        backStack = backStack + to
+        forwardStack = emptyList()
     }
 
-    fun openAlbum(a: AlbumItem) {
-        detail = DetailUi.Loading(a.title)
-        scope.launch {
-            YouTube.album(a.browseId)
-                .onSuccess { page ->
-                    detail = DetailUi.Songs(
-                        page.album.title.ifBlank { a.title }, "Album",
-                        listOfNotNull(page.album.artists?.joinToString { it.name }, page.album.year?.toString(), "${page.songs.size} songs").joinToString(" · "),
-                        page.album.thumbnail.ifBlank { a.thumbnail }, page.songs,
-                    )
-                }
-                .onFailure { detail = DetailUi.Failed(a.title, it.message ?: "Couldn't open this album") }
-        }
+    fun goBack() {
+        if (!canGoBack) return
+        forwardStack = listOf(route) + forwardStack
+        backStack = backStack.dropLast(1)
     }
 
-    fun openMood(item: MoodAndGenres.Item) {
-        detail = DetailUi.Loading(item.title)
-        scope.launch {
-            YouTube.browse(item.endpoint.browseId, item.endpoint.params)
-                .onSuccess { r -> detail = DetailUi.Collection(r.title ?: item.title, r.items.filter { it.items.isNotEmpty() }) }
-                .onFailure { detail = DetailUi.Failed(item.title, it.message ?: "Couldn't open this category") }
+    fun goForward() {
+        val next = forwardStack.firstOrNull() ?: return
+        forwardStack = forwardStack.drop(1)
+        backStack = backStack + next
+    }
+
+    /** Home button: Home without wiping history (like a browser's home button). */
+    fun goHome() = navigate(Route.Home)
+
+    /** Lyrics live in the main view; the player bar button toggles them. */
+    fun toggleLyrics() = if (route == Route.Lyrics) goBack() else navigate(Route.Lyrics)
+
+    /** Player bar buttons for the right panel: open on [tab], or close it if it already shows [tab]. */
+    fun togglePanel(tab: PanelTab) {
+        if (panelOpen && panelTab == tab) panelOpen = false else { panelTab = tab; panelOpen = true }
+    }
+
+    /** Shows [ui] as an online page (also used by tests to show a page without the network). */
+    fun showDetail(key: String, ui: DetailUi) { details[key] = ui; navigate(Route.Online(key)) }
+
+    private fun loadDetail(key: String, title: String, load: suspend () -> DetailUi) {
+        details[key] = DetailUi.Loading(title)
+        navigate(Route.Online(key))
+        scope.launch { details[key] = runCatching { load() }.getOrElse { DetailUi.Failed(title, it.message ?: "Couldn't open “$title”") } }
+    }
+
+    fun openPlaylist(p: PlaylistItem) = loadDetail("playlist:${p.id}", p.title) {
+        val page = YouTube.playlist(p.id).getOrThrow()
+        val songs = page.songs.toMutableList()
+        var next = page.songsContinuation ?: page.continuation
+        var pages = 0
+        while (next != null && pages < 4) { // long playlists: pull a few more pages
+            val more = YouTube.playlistContinuation(next).getOrNull() ?: break
+            songs += more.songs; next = more.continuation; pages++
         }
+        DetailUi.Songs(
+            page.playlist.title.ifBlank { p.title }, "Playlist",
+            listOfNotNull(page.playlist.author?.name, "${songs.size} songs").joinToString(" • "),
+            page.playlist.thumbnail ?: p.thumbnail, songs.distinctBy { it.id },
+        )
+    }
+
+    fun openAlbum(a: AlbumItem) = loadDetail("album:${a.browseId}", a.title) {
+        val page = YouTube.album(a.browseId).getOrThrow()
+        DetailUi.Songs(
+            page.album.title.ifBlank { a.title }, "Album",
+            listOfNotNull(page.album.artists?.joinToString { it.name }, page.album.year?.toString(), "${page.songs.size} songs").joinToString(" • "),
+            page.album.thumbnail.ifBlank { a.thumbnail }, page.songs,
+        )
+    }
+
+    fun openMood(item: MoodAndGenres.Item) = loadDetail("mood:${item.endpoint.browseId}:${item.endpoint.params}", item.title) {
+        val r = YouTube.browse(item.endpoint.browseId, item.endpoint.params).getOrThrow()
+        DetailUi.Collection(r.title ?: item.title, r.items.filter { it.items.isNotEmpty() })
     }
 
     /** Click on a card: open playlists/albums, play songs from their shelf, search for artists. */
@@ -359,7 +405,7 @@ class Controller(
     fun search(q: String = query) {
         query = q
         if (q.isBlank()) return
-        section = Section.SEARCH
+        navigate(Route.Search)
         searching = true; searchError = null
         scope.launch {
             runCatching { library.rememberSearch(q) }
@@ -429,6 +475,9 @@ class Controller(
             p.getProperty("autoplay")?.let { autoplay = it.toBoolean() }
             p.getProperty("panelOpen")?.let { panelOpen = it.toBoolean() }
             p.getProperty("repeat")?.let { r -> RepeatMode.entries.firstOrNull { it.name == r }?.let { queue = queue.copy(repeat = it) } }
+            p.getProperty("panelTab")?.let { t -> PanelTab.entries.firstOrNull { it.name == t }?.let { panelTab = it } }
+            p.getProperty("sidebarWidth")?.toFloatOrNull()?.let { sidebarWidth = it.coerceIn(SIDEBAR_MIN, SIDEBAR_MAX) }
+            p.getProperty("sidebarCollapsed")?.let { sidebarCollapsed = it.toBoolean() }
         }
     }
 
@@ -439,6 +488,8 @@ class Controller(
             Properties().apply {
                 setProperty("volume", volume.toString()); setProperty("autoplay", autoplay.toString())
                 setProperty("panelOpen", panelOpen.toString()); setProperty("repeat", queue.repeat.name)
+                setProperty("panelTab", panelTab.name)
+                setProperty("sidebarWidth", sidebarWidth.toString()); setProperty("sidebarCollapsed", sidebarCollapsed.toString())
             }.let { p -> f.outputStream().use { p.store(it, "W's MUSIC settings") } }
         }
     }
