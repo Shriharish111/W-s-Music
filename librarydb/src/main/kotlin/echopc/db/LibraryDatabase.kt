@@ -4,6 +4,9 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
+import androidx.room.migration.Migration
+import androidx.sqlite.SQLiteConnection
+import androidx.sqlite.execSQL
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import echo.music.iad1tya.db.entities.AlbumArtistMap
 import echo.music.iad1tya.db.entities.AlbumEntity
@@ -26,8 +29,11 @@ import kotlinx.coroutines.Dispatchers
 
 /**
  * Desktop library database. Same table/column definitions as the Android app's `InternalDatabase`
- * for the tables ported so far, but a fresh schema (version 1) with no migrations: the Android
- * file (schema v48, 21 tables) can't be opened directly because Room checks the full schema.
+ * for the tables ported so far, but its own schema: the Android file (schema v48, 21 tables) can't
+ * be opened directly because Room checks the full schema.
+ *
+ * v1: library, playlists, history, lyrics. v2: + desktop recommendation tables ([ListenSignal],
+ * [Feedback], [GeneratedMix], [RelatedCache], [ShelfStat]); see [MIGRATION_1_2].
  */
 @Database(
     entities = [
@@ -44,13 +50,18 @@ import kotlinx.coroutines.Dispatchers
         LyricsEntity::class,
         Event::class,
         PlayCountEntity::class,
+        ListenSignal::class,
+        Feedback::class,
+        GeneratedMix::class,
+        RelatedCache::class,
+        ShelfStat::class,
     ],
     views = [
         SortedSongArtistMap::class,
         SortedSongAlbumMap::class,
         PlaylistSongMapPreview::class,
     ],
-    version = 1,
+    version = 2,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)
@@ -81,6 +92,22 @@ abstract class LibraryDatabase : RoomDatabase() {
             Room.databaseBuilder<LibraryDatabase>(name = file.absolutePath)
                 .setDriver(BundledSQLiteDriver())
                 .setQueryCoroutineContext(Dispatchers.IO)
+                .addMigrations(MIGRATION_1_2)
                 .build()
+
+        /** Adds the recommendation tables. SQL copied from Room's generated schema so validation passes. */
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(connection: SQLiteConnection) {
+                listOf(
+                    "CREATE TABLE IF NOT EXISTS `listen_signal` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `songId` TEXT NOT NULL, `artistKey` TEXT NOT NULL, `artistName` TEXT NOT NULL, `timestamp` INTEGER NOT NULL, `playedMs` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `startReason` TEXT NOT NULL, `endReason` TEXT NOT NULL, `context` TEXT NOT NULL)",
+                    "CREATE INDEX IF NOT EXISTS `index_listen_signal_songId` ON `listen_signal` (`songId`)",
+                    "CREATE INDEX IF NOT EXISTS `index_listen_signal_timestamp` ON `listen_signal` (`timestamp`)",
+                    "CREATE TABLE IF NOT EXISTS `feedback` (`targetId` TEXT NOT NULL, `kind` TEXT NOT NULL, `context` TEXT NOT NULL, `timestamp` INTEGER NOT NULL, PRIMARY KEY(`targetId`, `kind`, `context`))",
+                    "CREATE TABLE IF NOT EXISTS `generated_mix` (`id` TEXT NOT NULL, `kind` TEXT NOT NULL, `title` TEXT NOT NULL, `subtitle` TEXT NOT NULL, `songs` TEXT NOT NULL, `position` INTEGER NOT NULL, `generatedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+                    "CREATE TABLE IF NOT EXISTS `related_cache` (`seedId` TEXT NOT NULL, `songs` TEXT NOT NULL, `fetchedAt` INTEGER NOT NULL, PRIMARY KEY(`seedId`))",
+                    "CREATE TABLE IF NOT EXISTS `shelf_stat` (`shelfKey` TEXT NOT NULL, `impressions` INTEGER NOT NULL, `clicks` INTEGER NOT NULL, PRIMARY KEY(`shelfKey`))",
+                ).forEach { connection.execSQL(it) }
+            }
+        }
     }
 }

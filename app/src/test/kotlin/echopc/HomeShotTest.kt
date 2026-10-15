@@ -34,6 +34,9 @@ class HomeShotTest {
             val p = repo.createPlaylist("Late night drive"); songs.take(3).forEach { repo.addToPlaylist(p.id, it) }
             repo.createPlaylist("Gym grind")
             songs.take(5).forEachIndexed { i, s -> repo.recordPlay(s, 60_000L + i) }
+            // Listening signals, then a real recommender run, so "Made for you" shows generated mixes.
+            songs.forEachIndexed { i, s -> repeat(3 - i % 3) { repo.recordSignal(s, 200_000, 200_000, echopc.db.StartReason.CLICK_ROW, echopc.db.EndReason.TRACK_DONE, "search") } }
+            c.recommender.refresh(force = true)
         }
         // Real feed data, loaded through the same controller code the app uses.
         c.loadHome()
@@ -51,6 +54,13 @@ class HomeShotTest {
             println("SHOT $name ${bmp.width}x${bmp.height}")
         }
         shot("h1-home")
+
+        // A generated mix page.
+        val t2 = System.currentTimeMillis()
+        while (c.mixes.isEmpty() && System.currentTimeMillis() - t2 < 10_000) Thread.sleep(200)
+        println("MIXES: ${c.mixes.map { "${it.title} (${c.mixSongs(it).size})" }}")
+        c.mixes.firstOrNull { it.kind == echopc.reco.MixKind.DAILY }?.let { c.navigate(Route.Mix(it.id)); shot("h3-mix") }
+        c.goHome()
 
         // Playlist detail page with real songs.
         val playlist = c.homeSections.flatMap { it.items }.filterIsInstance<PlaylistItem>().first()

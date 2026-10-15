@@ -18,7 +18,15 @@ import com.music.innertube.pages.BrowseResult
 import com.music.innertube.pages.HomePage
 import com.music.innertube.pages.MoodAndGenres
 import echopc.db.ImportResult
+import echopc.db.EndReason
+import echopc.db.GeneratedMix
 import echopc.db.LibraryRepository
+import echopc.db.StartReason
+import echopc.db.TrackCodec
+import echopc.reco.CandidateSource
+import echopc.reco.Recommender
+import echopc.reco.ShelfBandit
+import echopc.reco.YouTubeCandidates
 import java.io.File
 import java.util.Properties
 import kotlinx.coroutines.CoroutineScope
@@ -38,8 +46,23 @@ sealed interface Route {
     data object History : Route
     data object Lyrics : Route
     data class LocalPlaylist(val id: String) : Route
+    /** A generated mix (Daily Mix, Discover Weekly, ...). */
+    data class Mix(val id: String) : Route
     /** An online playlist / album / mood page; its content lives in [Controller.details] under [key]. */
     data class Online(val key: String) : Route
+}
+
+/** The "where it was played from" string stored with each play. */
+fun routeContext(r: Route): String = when (r) {
+    Route.Home -> "home"
+    Route.Search -> "search"
+    Route.Liked -> "liked"
+    Route.LibrarySongs -> "library"
+    Route.History -> "history"
+    Route.Lyrics -> "lyrics"
+    is Route.LocalPlaylist -> "local:${r.id}"
+    is Route.Online -> r.key
+    is Route.Mix -> "mix:${r.id}"
 }
 
 /** What the right-hand panel shows. */
@@ -93,6 +116,7 @@ class Controller(
     private val scope: CoroutineScope,
     val library: LibraryRepository,
     private val settingsFile: File? = null,
+    recoSource: CandidateSource? = null,
     engineFactory: (onState: (PlayerState) -> Unit, onEnded: () -> Unit) -> PlayerEngine,
 ) {
     // ---- navigation ----
@@ -142,9 +166,26 @@ class Controller(
     var newPlaylistOpen by mutableStateOf(false)
     var typing by mutableStateOf(false) // a text field has focus: keyboard shortcuts stand down
 
+    // ---- recommendations ----
+    val recommender = Recommender(library, recoSource ?: YouTubeCandidates(library))
+    var mixes by mutableStateOf<List<GeneratedMix>>(emptyList())
+    var mixesRefreshing by mutableStateOf(false)
+    private var signalsSinceRefresh = 0
+    private val bandit = ShelfBandit()
+    private var shelfStats: Map<String, Pair<Long, Long>> = emptyMap()
+    private var shelfOrder: List<String> = emptyList()
+    private val shelfImpressions = HashSet<String>()
+
     private val engine: PlayerEngine = engineFactory(::onEngineState, ::onEnded)
     private var playingSong: SongItem? = null
     private var playedMax = 0L
+    private var playStartReason = StartReason.CLICK_ROW
+    private var playContext = "home"
+    /** Where the current queue came from ("liked", "local:<id>", "mix:<id>", ...); radio additions are "radio". */
+    private var queueContext = "home"
+    private val radioIds = HashSet<String>()
+    /** Play logging: one worker runs the writes strictly in the order plays end. */
+    private val playLog = kotlinx.coroutines.channels.Channel<suspend () -> Unit>(kotlinx.coroutines.channels.Channel.UNLIMITED)
     private var sideJob: Job? = null
     private var lyricsJob: Job? = null
     private var toastJob: Job? = null
@@ -153,6 +194,9 @@ class Controller(
         loadSettings()
         engine.setVolume(volume.toDouble())
         scope.launch { library.likedIds.collect { likedIds = it.toSet() } }
+        scope.launch { library.mixes.collect { mixes = it } }
+        scope.launch { loadShelfStats() }
+        scope.launch(Dispatchers.IO) { for (write in playLog) runCatching { write() } }
     }
 
     // ---------------- engine callbacks ----------------
@@ -168,21 +212,38 @@ class Controller(
 
     // ---------------- playback control ----------------
 
-    /** Logs the song that just finished/was left, if it was listened to for at least 10 s. */
-    private fun flushPlay() {
-        val song = playingSong
+    /**
+     * Closes the play that is ending: a taste signal for any play (a quick skip is a strong signal),
+     * and a history entry if it was listened to for at least 10 s.
+     */
+    private fun flushPlay(endReason: String) {
+        val song = playingSong ?: return
         val ms = playedMax
+        val duration = playback.durationMs.takeIf { it > 0 } ?: ((song.duration ?: 0) * 1000L)
+        val reason = if (playback.error != null) EndReason.ERROR else endReason
+        val start = playStartReason; val context = playContext
+        val at = java.time.LocalDateTime.now()
         playedMax = 0
-        if (song != null && ms >= 10_000) scope.launch { runCatching { library.recordPlay(song, ms) } }
+        playingSong = null
+        playLog.trySend {
+            if (ms >= 10_000) library.recordPlay(song, ms)
+            if (ms > 0 || reason == EndReason.FWD_BUTTON) {
+                library.recordSignal(song, ms, duration, start, reason, context, at)
+                onSignalRecorded()
+            }
+        }
     }
 
-    fun startCurrent() {
+    /** Starts the queue's current song; [start] says why it starts, [ended] why the previous one stopped. */
+    fun startCurrent(start: String = StartReason.CLICK_ROW, ended: String = EndReason.NEW_SELECTION) {
         val song = queue.current ?: return
-        flushPlay()
+        flushPlay(ended)
         playingSong = song
+        playStartReason = start
+        playContext = if (song.id in radioIds) "radio" else queueContext
         positionMs = 0
         engine.play(song.id, queue.upNext?.id)
-        if (queue.upNext == null && autoplay) extendWithRadio(song, thenPlayFirstNew = false)
+        if (queue.upNext == null && autoplay) extendWithRadio(song, thenPlayFirstNew = false, ended = ended)
         loadSideEffects(song)
     }
 
@@ -196,35 +257,43 @@ class Controller(
         }
     }
 
-    private fun extendWithRadio(after: SongItem, thenPlayFirstNew: Boolean) {
+    private fun extendWithRadio(after: SongItem, thenPlayFirstNew: Boolean, ended: String) {
         scope.launch {
             val radio = fetchRadio(after).filter { r -> queue.items.none { it.id == r.id } }
             if (radio.isEmpty()) return@launch
+            radioIds += radio.map { it.id }
             val firstNew = queue.items.size
             queue = queue.copy(items = queue.items + radio)
-            if (thenPlayFirstNew) { queue = queue.jump(firstNew); startCurrent() } else engine.prefetch(radio.first().id)
+            if (thenPlayFirstNew) { queue = queue.jump(firstNew); startCurrent(StartReason.AUTOPLAY, ended) } else engine.prefetch(radio.first().id)
         }
     }
 
     fun skipNext(auto: Boolean = false) {
         val ni = queue.nextIndex(auto)
+        val reason = if (auto) EndReason.TRACK_DONE else EndReason.FWD_BUTTON
         when {
-            ni != null -> { queue = queue.jump(ni); startCurrent() }
-            autoplay && queue.current != null -> extendWithRadio(queue.current!!, thenPlayFirstNew = true)
-            else -> { flushPlay(); playingSong = null; engine.stop() }
+            ni != null -> { queue = queue.jump(ni); startCurrent(if (auto) StartReason.TRACK_DONE else StartReason.FWD_BUTTON, reason) }
+            autoplay && queue.current != null -> extendWithRadio(queue.current!!, thenPlayFirstNew = true, ended = reason)
+            else -> { flushPlay(reason); engine.stop() }
         }
     }
 
     fun skipPrevious() {
         if (positionMs > 3000) { seek(0); return }
-        queue.previousIndex()?.let { queue = queue.jump(it); startCurrent() }
+        queue.previousIndex()?.let { queue = queue.jump(it); startCurrent(StartReason.BACK_BUTTON, EndReason.BACK_BUTTON) }
     }
 
     fun togglePause() = engine.togglePause()
     fun seek(ms: Long) { positionMs = ms; engine.seek(ms) }
     fun changeVolume(v: Float) { volume = v; engine.setVolume(v.toDouble()) }
 
-    fun playFromList(list: List<SongItem>, index: Int) { queue = queue.withItems(list, index); startCurrent() }
+    /** Plays [list] from [index]; the page it was started from becomes the play context. */
+    fun playFromList(list: List<SongItem>, index: Int, context: String = routeContext(route)) {
+        queueContext = context
+        radioIds.clear()
+        queue = queue.withItems(list, index)
+        startCurrent()
+    }
     fun playShuffled(list: List<SongItem>) { if (list.isNotEmpty()) playFromList(list.shuffled(), 0) }
     fun jumpTo(index: Int) { queue = queue.jump(index); startCurrent() }
 
@@ -241,7 +310,7 @@ class Controller(
     fun removeFromQueue(position: Int) { queue = queue.remove(position) }
     fun shuffleQueue() { queue = queue.shuffledUpcoming(); queue.upNext?.let { engine.prefetch(it.id) } }
     fun clearQueue() {
-        flushPlay(); playingSong = null; engine.stop(); queue = QueueState(); lyrics = LyricsUiState.Idle
+        flushPlay(EndReason.CLOSED); engine.stop(); queue = QueueState(); lyrics = LyricsUiState.Idle
         accent = Accent(Ws.defaultAccent, Ws.defaultAccent2)
     }
     fun cycleRepeat() { queue = queue.copy(repeat = RepeatMode.entries[(queue.repeat.ordinal + 1) % RepeatMode.entries.size]) }
@@ -251,6 +320,8 @@ class Controller(
     /** Loads the YouTube Music home feed (optionally filtered by a mood chip) plus new releases and moods. */
     fun loadHome(chip: HomePage.Chip? = null) {
         homeChip = chip
+        shelfOrder = emptyList(); shelfImpressions.clear()
+        scope.launch { loadShelfStats() }
         homeLoading = true; homeError = null
         scope.launch {
             YouTube.home(browseId = chip?.endpoint?.browseId ?: "FEmusic_home", params = chip?.endpoint?.params)
@@ -388,7 +459,7 @@ class Controller(
             showToast("Building your mix…")
             val radio = fetchRadio(seed)
             if (radio.isEmpty()) { showToast("Couldn't build a mix right now"); return@launch }
-            playFromList(listOf(seed) + radio.take(49), 0)
+            playFromList(listOf(seed) + radio.take(49), 0, context = "radio")
         }
     }
 
@@ -399,6 +470,54 @@ class Controller(
             showToast("Saved “${p.name}” to your playlists")
         }
     }
+
+    // ---------------- recommendations ----------------
+
+    /** Rebuilds whatever mixes are due (in the background); [force] rebuilds all of them. */
+    fun refreshMixes(force: Boolean = false) {
+        if (mixesRefreshing) return
+        mixesRefreshing = true
+        signalsSinceRefresh = 0
+        scope.launch(Dispatchers.IO) {
+            runCatching { recommender.refresh(force) }.onFailure { println("[reco] refresh failed: ${it.message}") }
+            mixesRefreshing = false
+        }
+    }
+
+    private fun onSignalRecorded() {
+        // Plenty of new listening: let the daily mixes catch up without waiting for tomorrow.
+        if (++signalsSinceRefresh >= 20) refreshMixes()
+    }
+
+    fun mixSongs(mix: GeneratedMix): List<SongItem> = TrackCodec.decode(mix.songs)
+
+    fun playGeneratedMix(mix: GeneratedMix) {
+        val songs = mixSongs(mix)
+        if (songs.isNotEmpty()) playFromList(songs, 0, context = "mix:${mix.id}")
+    }
+
+    private suspend fun loadShelfStats() {
+        runCatching { shelfStats = library.shelfStats().mapValues { it.value.impressions to it.value.clicks } }
+    }
+
+    /**
+     * Home shelf order for this visit, from the bandit. Fixed once drawn (so the page doesn't shuffle
+     * while you look at it); shelves that appear later (infinite scroll) are ranked among themselves
+     * and added at the end.
+     */
+    fun orderShelves(keys: List<String>): List<String> {
+        val fresh = keys.filter { it !in shelfOrder }
+        if (fresh.isNotEmpty()) shelfOrder = shelfOrder + bandit.order(fresh, shelfStats)
+        return shelfOrder.filter { it in keys }
+    }
+
+    /** Counts each shelf once per Home visit. */
+    fun noteShelfImpressions(keys: List<String>) {
+        val new = keys.filter { shelfImpressions.add(it) }
+        if (new.isNotEmpty()) scope.launch { runCatching { library.recordShelfImpressions(new) } }
+    }
+
+    fun noteShelfClick(key: String) { scope.launch { runCatching { library.recordShelfClick(key) } } }
 
     // ---------------- search ----------------
 
@@ -457,13 +576,20 @@ class Controller(
             loadHome() // the feed no longer waits for the stream resolver warm-up
             delay(4_000) // keep the first seconds light; this only shortens the first song's start
             InnerTubeXStream.prewarm()
+            refreshMixes()
         }
     }
 
     /** Saves the last listen and settings; called when the window closes. */
     fun shutdown() {
         val song = playingSong; val ms = playedMax
-        if (song != null && ms >= 10_000) runBlocking { runCatching { library.recordPlay(song, ms) } }
+        val duration = playback.durationMs.takeIf { it > 0 } ?: ((song?.duration ?: 0) * 1000L)
+        if (song != null) runBlocking {
+            runCatching {
+                if (ms >= 10_000) library.recordPlay(song, ms)
+                if (ms > 0) library.recordSignal(song, ms, duration, playStartReason, EndReason.CLOSED, playContext)
+            }
+        }
         saveSettings()
     }
 

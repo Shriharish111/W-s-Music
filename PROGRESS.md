@@ -11,6 +11,18 @@ Last updated: 2026-10-15. This file lets anyone (or another Claude session / acc
 - Local data in `%APPDATA%\WsMusic` (Room/SQLite). Settings: volume, autoplay, repeat, panel.
 - Packaged for friends as a standalone Windows folder (`gradlew :app:createDistributable`).
 
+## Spotify-style redesign (branch `spotify-redesign`, 2026-10-15)
+Plan: `D:\WMUSIC\PLAN.md`; client research notes: `D:\WMUSIC\_research\SPOTIFY_NOTES.md`.
+- **Phase 2 UI (done):** three-panel shell (`Shell.kt`, `LibrarySidebar.kt`, `NowPlayingView.kt`, `PlayerBar.kt`),
+  shared collection pages / track table (`Tracks.kt`), back/forward `Route` stack in `Controller`, Figtree font.
+- **Phase 3 engine (done):** DB schema v2 (`MIGRATION_1_2` in `LibraryDatabase.kt`) adds `listen_signal`, `feedback`,
+  `generated_mix`, `related_cache`, `shelf_stat`. Every play logs start/end reason + ms played (`Controller.flushPlay`).
+  `reco/`: `TasteProfile` (7/180-day decay, skips negative, likes +3), `MixEngine` (Daily Mix clusters via label
+  propagation, Discover Weekly co-occurrence, Release Radar, On Repeat, Repeat Rewind), `ShelfBandit` (Thompson
+  sampling for Home shelf order), `Recommender` (schedule: daily / Monday / Friday, cached YouTube radio).
+  Smoke: `gradlew :app:smoke -Pmain=echopc.RecoSmokeKt` builds real mixes in a temp DB (~25 s).
+- **Phase 4 (next):** Smart Shuffle and feedback menu items (hide song, not interested, ban artist, exclude from taste).
+
 ## Stream playback (important background)
 YouTube refuses anonymous stream URLs for most clients. What works today: InnerTubeX (`innertubex` 0.7.2)
 with **SABR** audio (`allowSabr = true`) via `InnerTubeXStream.kt` + `downloadSabrAudio`; the whole AAC file is

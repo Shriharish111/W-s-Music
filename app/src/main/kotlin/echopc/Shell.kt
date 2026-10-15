@@ -106,6 +106,7 @@ private fun MainView(c: Controller, modifier: Modifier) {
             Route.Lyrics -> LyricsPage(c)
             is Route.LocalPlaylist -> LocalPlaylistPage(c, r.id)
             is Route.Online -> OnlinePage(c, c.details[r.key])
+            is Route.Mix -> MixPage(c, r.id)
         }
     }
 }

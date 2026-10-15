@@ -158,6 +158,72 @@ abstract class LibraryDao {
     @Query("DELETE FROM search_history")
     abstract suspend fun clearSearchHistory()
 
+    // ---- recommendation engine (schema v2) ----
+
+    @Insert
+    abstract suspend fun insert(signal: ListenSignal): Long
+
+    @Query("SELECT * FROM listen_signal WHERE timestamp >= :since ORDER BY timestamp, id")
+    abstract suspend fun signalsSince(since: LocalDateTime): List<ListenSignal>
+
+    @Query("SELECT COUNT(*) FROM listen_signal WHERE timestamp > :since")
+    abstract suspend fun countSignalsAfter(since: LocalDateTime): Int
+
+    @Transaction
+    @Query("SELECT * FROM song WHERE id IN (:ids)")
+    abstract suspend fun songs(ids: List<String>): List<Song>
+
+    @Query("SELECT DISTINCT songId FROM playlist_song_map")
+    abstract suspend fun songIdsInPlaylists(): List<String>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun insert(feedback: Feedback)
+
+    @Query("DELETE FROM feedback WHERE targetId = :targetId AND kind = :kind AND context = :context")
+    abstract suspend fun deleteFeedback(targetId: String, kind: String, context: String)
+
+    @Query("SELECT * FROM feedback")
+    abstract fun feedback(): Flow<List<Feedback>>
+
+    @Query("SELECT * FROM feedback")
+    abstract suspend fun feedbackNow(): List<Feedback>
+
+    @Query("SELECT * FROM generated_mix ORDER BY position")
+    abstract fun mixes(): Flow<List<GeneratedMix>>
+
+    @Query("SELECT * FROM generated_mix ORDER BY position")
+    abstract suspend fun mixesNow(): List<GeneratedMix>
+
+    @Query("SELECT * FROM generated_mix WHERE id = :id")
+    abstract fun mix(id: String): Flow<GeneratedMix?>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun upsert(mix: GeneratedMix)
+
+    @Query("DELETE FROM generated_mix WHERE kind = :kind AND id NOT IN (:keep)")
+    abstract suspend fun deleteMixesExcept(kind: String, keep: List<String>)
+
+    @Query("SELECT * FROM related_cache WHERE seedId = :seedId")
+    abstract suspend fun related(seedId: String): RelatedCache?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun upsert(related: RelatedCache)
+
+    @Query("DELETE FROM related_cache WHERE fetchedAt < :before")
+    abstract suspend fun pruneRelated(before: LocalDateTime)
+
+    @Query("SELECT * FROM shelf_stat")
+    abstract suspend fun shelfStats(): List<ShelfStat>
+
+    @Query("INSERT OR IGNORE INTO shelf_stat (shelfKey, impressions, clicks) VALUES (:key, 0, 0)")
+    abstract suspend fun ensureShelf(key: String)
+
+    @Query("UPDATE shelf_stat SET impressions = impressions + 1 WHERE shelfKey IN (:keys)")
+    abstract suspend fun addImpressions(keys: List<String>)
+
+    @Query("UPDATE shelf_stat SET clicks = clicks + 1 WHERE shelfKey = :key")
+    abstract suspend fun addClick(key: String)
+
     // ---- lyrics cache ----
 
     @Query("SELECT * FROM lyrics WHERE id = :id")

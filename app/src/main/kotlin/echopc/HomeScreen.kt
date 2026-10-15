@@ -74,6 +74,7 @@ fun MediaCard(
     onPlay: (() -> Unit)? = onClick,
     round: Boolean = false,
     size: Dp = 184.dp,
+    coverLabel: String? = null,
 ) {
     val source = remember { MutableInteractionSource() }
     val hovered by source.collectIsHoveredAsState()
@@ -88,6 +89,7 @@ fun MediaCard(
     ) {
         Box(Modifier.size(cover)) {
             Thumb(thumb, cover, corner = if (round) cover / 2 else 6.dp, seed = title)
+            if (coverLabel != null) MixCoverLabel(coverLabel, cover)
             if (onPlay != null && hovered) PlayButton(false, false, true, onPlay, Modifier.align(Alignment.BottomEnd).padding(8.dp), size = 48.dp, onAccent = true)
         }
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -97,8 +99,20 @@ fun MediaCard(
     }
 }
 
+/** Generated-mix covers: the lead song's art with the mix name set large across a dark fade. */
 @Composable
-fun ItemCard(c: Controller, item: YTItem, siblings: List<YTItem>) {
+private fun MixCoverLabel(label: String, cover: Dp) {
+    Box(
+        Modifier.size(cover).clip(RoundedCornerShape(6.dp))
+            .background(Brush.verticalGradient(0.45f to Color.Transparent, 1f to Color.Black.copy(alpha = 0.85f))),
+        contentAlignment = Alignment.BottomStart,
+    ) {
+        Text(label, Modifier.padding(12.dp), style = MaterialTheme.typography.titleLarge, color = Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+fun ItemCard(c: Controller, item: YTItem, siblings: List<YTItem>, onAction: () -> Unit = {}) {
     val sub = when (item) {
         is SongItem -> item.artists.joinToString { it.name }
         is AlbumItem -> listOfNotNull(item.year?.toString(), item.artists?.joinToString { it.name }).joinToString(" • ").ifBlank { "Album" }
@@ -106,7 +120,7 @@ fun ItemCard(c: Controller, item: YTItem, siblings: List<YTItem>) {
         is ArtistItem -> "Artist"
         else -> ""
     }
-    MediaCard(item.thumbnail, item.title, sub, { c.openItem(item, siblings) }, onPlay = { c.playItem(item, siblings) }, round = item is ArtistItem)
+    MediaCard(item.thumbnail, item.title, sub, { onAction(); c.openItem(item, siblings) }, onPlay = { onAction(); c.playItem(item, siblings) }, round = item is ArtistItem)
 }
 
 /** A titled horizontal row of cards with left/right scroll buttons (a mouse wheel can't scroll sideways). */
@@ -169,38 +183,41 @@ fun HomeScreen(c: Controller) {
                     QuickTiles(c, playlists, recents, c.homeSections.firstOrNull()?.items)
                 }
             }
-            if (seeds.isNotEmpty()) item("mixes") {
-                Shelf("Made for you", "Mixes built from what you play and like") {
-                    itemsIndexed(seeds, key = { _, s -> "mix-${s.id}" }) { _, seed ->
-                        val artist = seed.artists.firstOrNull()?.name ?: seed.title
-                        MediaCard(seed.thumbnail, "$artist Mix", "Starts with ${seed.title}, then similar songs", { c.playMix(seed) })
-                    }
-                }
-            }
-            if (recents.isNotEmpty()) item("recent") {
-                Shelf("Recently played") {
-                    itemsIndexed(recents, key = { _, s -> "recent-${s.id}" }) { i, song ->
-                        MediaCard(song.thumbnail, song.title, song.artists.joinToString { it.name }, { c.playFromList(recents, i) })
-                    }
-                }
-            }
             when {
-                c.homeLoading && c.homeSections.isEmpty() -> item("loading") { Column(verticalArrangement = Arrangement.spacedBy(32.dp)) { SkeletonShelf(); SkeletonShelf() } }
+                c.homeLoading && c.homeSections.isEmpty() && c.mixes.isEmpty() && recents.isEmpty() ->
+                    item("loading") { Column(verticalArrangement = Arrangement.spacedBy(32.dp)) { SkeletonShelf(); SkeletonShelf() } }
                 c.homeError != null && c.homeSections.isEmpty() -> item("error") {
                     EmptyState("Couldn't reach YouTube Music", "${c.homeError}. Check your internet connection, then try again.") {
                         PrimaryButton("Try again", { c.loadHome(c.homeChip) }, icon = Icons.Rounded.Refresh)
                     }
                 }
-                else -> itemsIndexed(c.homeSections, key = { i, s -> "sec-$i-${s.title}" }) { i, section ->
-                    Column(verticalArrangement = Arrangement.spacedBy(32.dp)) {
-                        Shelf(section.title, section.label?.lowercase()?.replaceFirstChar { it.uppercase() }) {
-                            itemsIndexed(section.items) { _, item -> ItemCard(c, item, section.items) }
-                        }
-                        if (i == 0 && c.newReleases.isNotEmpty()) Shelf("New releases", "Albums and singles that just came out") {
-                            itemsIndexed(c.newReleases, key = { _, a -> "new-${a.id}" }) { _, album -> ItemCard(c, album, c.newReleases) }
-                        }
+            }
+            // Shelves in the order the bandit picked for this visit (see ShelfBandit).
+            val shelves = LinkedHashMap<String, @Composable () -> Unit>()
+            if (c.mixes.isNotEmpty() || seeds.isNotEmpty()) shelves["made-for-you"] = { MadeForYouShelf(c, seeds) }
+            if (recents.isNotEmpty()) shelves["recently-played"] = {
+                Shelf("Recently played") {
+                    itemsIndexed(recents, key = { _, s -> "recent-${s.id}" }) { i, song ->
+                        MediaCard(song.thumbnail, song.title, song.artists.joinToString { it.name }, { c.noteShelfClick("recently-played"); c.playFromList(recents, i) })
                     }
                 }
+            }
+            c.homeSections.forEachIndexed { i, section ->
+                val key = "yt:${section.title}"
+                if (key !in shelves) shelves[key] = {
+                    Shelf(section.title, section.label?.lowercase()?.replaceFirstChar { it.uppercase() }) {
+                        itemsIndexed(section.items) { _, item -> ItemCard(c, item, section.items) { c.noteShelfClick(key) } }
+                    }
+                }
+                if (i == 0 && c.newReleases.isNotEmpty()) shelves["new-releases"] = {
+                    Shelf("New releases", "Albums and singles that just came out") {
+                        itemsIndexed(c.newReleases, key = { _, a -> "new-${a.id}" }) { _, album -> ItemCard(c, album, c.newReleases) { c.noteShelfClick("new-releases") } }
+                    }
+                }
+            }
+            for (key in c.orderShelves(shelves.keys.toList())) item("shelf-$key") {
+                LaunchedEffect(key) { c.noteShelfImpressions(listOf(key)) } // composed = on (or near) screen
+                shelves.getValue(key)()
             }
             if (c.moods.isNotEmpty()) item("moods") {
                 Column(Modifier.padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -212,6 +229,26 @@ fun HomeScreen(c: Controller) {
                 LaunchedEffect(c.homeMore) { c.loadMoreHome() } // only composed near the bottom: infinite scroll
                 Box(Modifier.fillMaxWidth().height(60.dp), contentAlignment = Alignment.Center) { MetaText("Loading more") }
             }
+        }
+    }
+}
+
+/** Generated mixes (Daily Mixes, Discover Weekly, ...); before the first build, radio mixes from recent artists. */
+@Composable
+private fun MadeForYouShelf(c: Controller, seeds: List<SongItem>) {
+    val subtitle = if (c.mixesRefreshing && c.mixes.isEmpty()) "Building your mixes from what you play" else "Mixes built from what you play and like"
+    Shelf("Made for you", subtitle) {
+        if (c.mixes.isNotEmpty()) itemsIndexed(c.mixes, key = { _, m -> "gen-${m.id}" }) { _, mix ->
+            val cover = remember(mix.songs) { c.mixSongs(mix).firstOrNull()?.thumbnail }
+            MediaCard(
+                cover, mix.title, mix.subtitle,
+                onClick = { c.noteShelfClick("made-for-you"); c.navigate(Route.Mix(mix.id)) },
+                onPlay = { c.noteShelfClick("made-for-you"); c.playGeneratedMix(mix) },
+                coverLabel = mix.title,
+            )
+        } else itemsIndexed(seeds, key = { _, s -> "mix-${s.id}" }) { _, seed ->
+            val artist = seed.artists.firstOrNull()?.name ?: seed.title
+            MediaCard(seed.thumbnail, "$artist Mix", "Starts with ${seed.title}, then similar songs", { c.noteShelfClick("made-for-you"); c.playMix(seed) }, coverLabel = "$artist Mix")
         }
     }
 }

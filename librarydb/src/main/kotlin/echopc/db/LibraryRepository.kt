@@ -147,6 +147,62 @@ class LibraryRepository(private val db: LibraryDatabase) {
 
     suspend fun clearSearchHistory() = dao.clearSearchHistory()
 
+    // ---- recommendation signals & feedback ----
+
+    /** Records one play (any length) for the taste profile; the song's metadata is saved too. */
+    suspend fun recordSignal(item: SongItem, playedMs: Long, durationMs: Long, startReason: String, endReason: String, context: String, at: LocalDateTime = LocalDateTime.now()) {
+        save(item)
+        dao.insert(
+            ListenSignal(
+                songId = item.id, artistKey = item.artistKey(), artistName = item.artists.firstOrNull()?.name.orEmpty(),
+                timestamp = at, playedMs = playedMs, durationMs = durationMs,
+                startReason = startReason, endReason = endReason, context = context,
+            ),
+        )
+    }
+
+    suspend fun signalsSince(since: LocalDateTime): List<ListenSignal> = dao.signalsSince(since)
+    suspend fun countSignalsAfter(since: LocalDateTime): Int = dao.countSignalsAfter(since)
+
+    /** Songs stored in the library database (played, liked, playlists) as player models, by id. */
+    suspend fun songsById(ids: Collection<String>): Map<String, SongItem> {
+        if (ids.isEmpty()) return emptyMap()
+        return ids.distinct().chunked(500).flatMap { dao.songs(it).withArtistOrder() }.associate { it.song.id to it.toSongItem() }
+    }
+
+    suspend fun songIdsInPlaylists(): Set<String> = dao.songIdsInPlaylists().toSet()
+
+    val feedback: Flow<List<Feedback>> = dao.feedback()
+    suspend fun feedbackNow(): List<Feedback> = dao.feedbackNow()
+    suspend fun addFeedback(targetId: String, kind: String, context: String = "") = dao.insert(Feedback(targetId, kind, context, LocalDateTime.now()))
+    suspend fun removeFeedback(targetId: String, kind: String, context: String = "") = dao.deleteFeedback(targetId, kind, context)
+
+    // ---- generated mixes & caches ----
+
+    val mixes: Flow<List<GeneratedMix>> = dao.mixes()
+    suspend fun mixesNow(): List<GeneratedMix> = dao.mixesNow()
+    fun mix(id: String): Flow<GeneratedMix?> = dao.mix(id)
+
+    /** Replaces all mixes of [kind] with [mixes] (in one go, so Home never shows a half-written set). */
+    suspend fun replaceMixes(kind: String, mixes: List<GeneratedMix>) {
+        mixes.forEach { dao.upsert(it) }
+        dao.deleteMixesExcept(kind, mixes.map { it.id }.ifEmpty { listOf("") })
+    }
+
+    suspend fun cachedRelated(seedId: String, maxAgeDays: Long): List<SongItem>? =
+        dao.related(seedId)?.takeIf { it.fetchedAt.isAfter(LocalDateTime.now().minusDays(maxAgeDays)) }?.let { TrackCodec.decode(it.songs) }
+
+    suspend fun cacheRelated(seedId: String, songs: List<SongItem>) = dao.upsert(RelatedCache(seedId, TrackCodec.encode(songs), LocalDateTime.now()))
+    suspend fun pruneRelated(olderThanDays: Long) = dao.pruneRelated(LocalDateTime.now().minusDays(olderThanDays))
+
+    suspend fun shelfStats(): Map<String, ShelfStat> = dao.shelfStats().associateBy { it.shelfKey }
+    suspend fun recordShelfImpressions(keys: List<String>) {
+        if (keys.isEmpty()) return
+        keys.forEach { dao.ensureShelf(it) }
+        dao.addImpressions(keys)
+    }
+    suspend fun recordShelfClick(key: String) { dao.ensureShelf(key); dao.addClick(key) }
+
     // ---- lyrics cache ----
 
     suspend fun cachedLyrics(id: String): LyricsEntity? = dao.lyrics(id)

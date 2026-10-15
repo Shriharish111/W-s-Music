@@ -256,6 +256,23 @@ fun LocalPlaylistPage(c: Controller, id: String) {
     )
 }
 
+/** A generated mix. It reads from the in-memory list, so it opens instantly. */
+@Composable
+fun MixPage(c: Controller, id: String) {
+    val mix = c.mixes.firstOrNull { it.id == id }
+    if (mix == null) {
+        EmptyState("This mix isn't ready", "Mixes are rebuilt from your listening. Play some more music and it will show up on Home.")
+        return
+    }
+    val songs = remember(mix.songs) { c.mixSongs(mix) }
+    val updated = remember(mix.generatedAt) { mix.generatedAt.format(DateTimeFormatter.ofPattern("MMM d")) }
+    CollectionPage(
+        c, "Made for you", mix.title, "${mix.subtitle} • ${songs.size} songs • updated $updated",
+        CoverArt.Image(songs.firstOrNull()?.thumbnail, mix.title), songs,
+        emptyText = "Nothing in this mix yet.",
+    )
+}
+
 // =====================================================================================
 //  Lyrics (full page)
 // =====================================================================================
