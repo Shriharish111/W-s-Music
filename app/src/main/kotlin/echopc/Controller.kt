@@ -214,7 +214,7 @@ class Controller(
     private var searchedQuery = ""
     /** What the last finished search was for; the typing view shows while the box differs from it. */
     var lastSearched by mutableStateOf("")
-        private set
+        internal set
     var suggestions by mutableStateOf<SearchSuggestions?>(null)
     var suggestionsFor by mutableStateOf("")
     var suggestionsLoading by mutableStateOf(false)
