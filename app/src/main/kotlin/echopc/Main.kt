@@ -41,7 +41,12 @@ fun settingsFile(): File {
     return File(dir, "settings.properties")
 }
 
-fun main() = application {
+fun main() {
+    Device.configure() // render API + audio engine must be chosen before any UI class loads
+    runApp()
+}
+
+private fun runApp() = application {
     Trace.mark("main entered")
     val scope = remember { kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default) }
     // WSMUSIC_BENCH: benchmark mode (temporary database, settings not saved, muted autoplay of one search result).
@@ -52,7 +57,7 @@ fun main() = application {
     }
     val controller = remember {
         LyricsRepository.store = library
-        Controller(scope, library, if (bench) null else settingsFile()) { onState, onEnded -> DesktopPlayer(onState, onEnded) }.also { Trace.mark("controller created") }
+        Controller(scope, library, if (bench) null else settingsFile()) { onState, onEnded -> AdaptivePlayer(onState, onEnded) }.also { Trace.mark("controller created") }
     }
     val shortcuts = remember { ShortcutHandler(controller) }
     val icon = remember { BitmapPainter(renderAppIcon(256).toComposeImageBitmap()) }
@@ -82,6 +87,8 @@ fun main() = application {
             applyDarkTitleBar(window)
             Trace.mark("title bar styled")
             controller.warmUp()
+            kotlinx.coroutines.delay(5_000)
+            Device.launchSucceeded() // window survived the first seconds: the start counts as good
             if (bench) {
                 controller.changeVolume(0f)
                 controller.search("daft punk get lucky")

@@ -36,8 +36,8 @@ class LoadedThumb(val bitmap: ImageBitmap, val dominant: Color, val bytes: Int)
  * off the UI thread, keeps a bounded LRU cache and works out a vivid dominant colour for theming.
  */
 object ThumbCache {
-    // Bounded by memory (not by count): pictures are kept in an LRU until they add up to ~40 MB.
-    private const val MAX_BYTES = 40L * 1024 * 1024
+    // Bounded by memory (not by count): pictures are kept in an LRU until they add up to ~40 MB (12 MB on weak PCs).
+    private val MAX_BYTES = Device.thumbBudget
     private val cache = LinkedHashMap<String, LoadedThumb>(128, 0.75f, true)
     private var cachedBytes = 0L
 

@@ -46,6 +46,16 @@ Useful places to start changing things:
 - App behaviour (queue, search, home feed, import): `Controller.kt`
 - JVM flags and packaging: `app/build.gradle.kts`
 
+## Older and low-end PCs
+
+The app adapts to the PC it runs on (see `Device.kt`); nothing needs to be configured.
+
+- **Weak PC** (2 CPU cores or fewer, or about 4 GB RAM or less): smaller album-art cache, later background work and the light audio engine. Force it with `WSMUSIC_LITE=1` (or `0` to turn it off).
+- **No working OpenGL / blank window**: if one start never shows a window, the next start draws with the CPU instead and remembers it. Force a renderer with `WSMUSIC_RENDER=OPENGL|SOFTWARE_COMPAT`.
+- **No JavaFX audio** (Windows "N" editions, missing runtimes): playback switches to a pure-Java AAC engine (`CompatPlayer`). Force it with `WSMUSIC_AUDIO=compat|fx`.
+- **No administrator rights**: the installer installs per user, and `gradlew :app:portableZip` builds a zip you can unpack and run from anywhere.
+- If something still fails, `%APPDATA%\WsMusic\wsmusic.log` says why; delete `device.properties` next to it to reset the choices.
+
 ## Tests
 - `ImporterTest` builds a fake Android database from the app's real schema and imports it
 - `UiFlowTest` clicks through likes, playlists, import dialogs and the Home page
