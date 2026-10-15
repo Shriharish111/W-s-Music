@@ -85,6 +85,18 @@ data class RelatedCache(
     val fetchedAt: LocalDateTime,
 )
 
+/**
+ * An artist the user said they like when asked ("Tell us what you like"). It seeds the taste profile
+ * until real listening takes over. [artistKey] is the artist's YouTube channel id, like a song's artist key.
+ */
+@Entity(tableName = "taste_pick")
+data class TastePick(
+    @PrimaryKey val artistKey: String,
+    val name: String,
+    val thumbnail: String,
+    val pickedAt: LocalDateTime,
+)
+
 /** Home shelf statistics for the shelf-ordering bandit. */
 @Entity(tableName = "shelf_stat")
 data class ShelfStat(

@@ -243,6 +243,26 @@ abstract class LibraryDao {
     @Query("UPDATE shelf_stat SET clicks = clicks + 1 WHERE shelfKey = :key")
     abstract suspend fun addClick(key: String)
 
+    // ---- taste picks ----
+
+    @Query("SELECT * FROM taste_pick ORDER BY pickedAt, artistKey")
+    abstract fun tastePicks(): Flow<List<TastePick>>
+
+    @Query("SELECT * FROM taste_pick ORDER BY pickedAt, artistKey")
+    abstract suspend fun tastePicksNow(): List<TastePick>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun insertAll(picks: List<TastePick>)
+
+    @Query("DELETE FROM taste_pick")
+    abstract suspend fun clearTastePicks()
+
+    @Transaction
+    open suspend fun replaceTastePicks(picks: List<TastePick>) {
+        clearTastePicks()
+        insertAll(picks)
+    }
+
     // ---- lyrics cache ----
 
     @Query("SELECT * FROM lyrics WHERE id = :id")

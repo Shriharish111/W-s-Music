@@ -16,6 +16,7 @@ same way that app does.
 - **Library**: likes, playlists, play history, stored locally in SQLite (Room)
 - **Import from the Android app**: likes, playlists and history from its `.backup` / `song.db`
 - Accent colour follows the current album art
+- New users: pick artists you like (or skip) and get your first mixes straight away; until then Home shows YouTube Music's popular songs
 - Keyboard shortcuts for playback, volume, shuffle, repeat, search and navigation (press Ctrl+/ for the list); hover a button for its name and shortcut; right-click a song for its options
 
 ## Build and run

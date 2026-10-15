@@ -180,6 +180,14 @@ class LibraryRepository(private val db: LibraryDatabase) {
     suspend fun addFeedback(targetId: String, kind: String, context: String = "") = dao.insert(Feedback(targetId, kind, context, LocalDateTime.now()))
     suspend fun removeFeedback(targetId: String, kind: String, context: String = "") = dao.deleteFeedback(targetId, kind, context)
 
+    // ---- taste picks ----
+
+    val tastePicks: Flow<List<TastePick>> = dao.tastePicks()
+    suspend fun tastePicksNow(): List<TastePick> = dao.tastePicksNow()
+
+    /** Replaces the user's picked artists (an empty list clears them). */
+    suspend fun replaceTastePicks(picks: List<TastePick>) = dao.replaceTastePicks(picks)
+
     // ---- generated mixes & caches ----
 
     val mixes: Flow<List<GeneratedMix>> = dao.mixes()

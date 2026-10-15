@@ -138,6 +138,23 @@ class Recommender(
 
     class Inputs(val plays: List<Play>, val profile: TasteProfile, val meta: Map<String, SongItem>, val recentSeeds: List<SongItem>, val likedCount: Int)
 
+    /** Songs standing in for the artists the user picked: up to three top songs each (or just the artist if none load). */
+    private suspend fun pickSeeds(now: LocalDateTime): Pair<List<Saved>, Map<String, SongItem>> {
+        val saved = ArrayList<Saved>(); val meta = HashMap<String, SongItem>()
+        for (pick in library.tastePicksNow()) {
+            val songs = runCatching { source.topSongs(pick.artistKey) }.getOrDefault(emptyList()).take(3)
+            val at = pick.pickedAt.millis()
+            if (songs.isEmpty()) {
+                // Offline or nothing listed: the artist alone still steers Release Radar and discovery.
+                saved += Saved("pick:${pick.artistKey}", pick.artistKey, pick.name, at)
+            } else songs.forEach { s ->
+                saved += Saved(s.id, pick.artistKey, pick.name, at) // credited to the picked artist, not a featured one
+                meta[s.id] = s
+            }
+        }
+        return saved to meta
+    }
+
     suspend fun loadInputs(now: LocalDateTime): Inputs {
         // Plays from before the signal log (history imported from the Android app, or older app versions) count too.
         library.backfillSignalsFromHistory()
@@ -151,13 +168,14 @@ class Recommender(
         val playlistIds = library.songIdsInPlaylists() - liked.map { it.songId }.toSet()
         val meta = library.songsById(plays.map { it.songId } + liked.map { it.songId } + playlistIds) + likedRows.associate { it.song.id to it.toSongItem() }
         val inPlaylists = playlistIds.mapNotNull { id -> meta[id]?.let { Saved(id, it.artistKey(), it.artists.firstOrNull()?.name.orEmpty(), null) } }
-        val profile = TasteProfile.build(plays, liked, inPlaylists, library.feedbackNow(), now.millis())
+        val (pickSaved, pickMeta) = pickSeeds(now)
+        val profile = TasteProfile.build(plays, liked, inPlaylists, library.feedbackNow(), now.millis(), pickSongs = pickSaved)
 
         // Discover Weekly seeds: what the user has loved over the last four weeks, else their likes.
         val since = now.minusDays(28).millis()
         val recent = profile.tracks.values.filter { it.lastPlayed >= since && it.shortScore > 0 && it.songId !in profile.excluded }
             .sortedByDescending { it.shortScore }.mapNotNull { meta[it.songId] }
-        val seeds = (recent + liked.mapNotNull { meta[it.songId] }).distinctBy { it.id }.take(15)
-        return Inputs(plays, profile, meta, seeds, liked.size)
+        val seeds = (recent + liked.mapNotNull { meta[it.songId] } + pickMeta.values).distinctBy { it.id }.take(15)
+        return Inputs(plays, profile, meta + pickMeta, seeds, liked.size)
     }
 }

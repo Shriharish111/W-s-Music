@@ -33,7 +33,7 @@ import kotlinx.coroutines.Dispatchers
  * be opened directly because Room checks the full schema.
  *
  * v1: library, playlists, history, lyrics. v2: + desktop recommendation tables ([ListenSignal],
- * [Feedback], [GeneratedMix], [RelatedCache], [ShelfStat]); see [MIGRATION_1_2].
+ * [Feedback], [GeneratedMix], [RelatedCache], [ShelfStat]); see [MIGRATION_1_2]. v3: + [TastePick] ([MIGRATION_2_3]).
  */
 @Database(
     entities = [
@@ -55,13 +55,14 @@ import kotlinx.coroutines.Dispatchers
         GeneratedMix::class,
         RelatedCache::class,
         ShelfStat::class,
+        TastePick::class,
     ],
     views = [
         SortedSongArtistMap::class,
         SortedSongAlbumMap::class,
         PlaylistSongMapPreview::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)
@@ -92,8 +93,15 @@ abstract class LibraryDatabase : RoomDatabase() {
             Room.databaseBuilder<LibraryDatabase>(name = file.absolutePath)
                 .setDriver(BundledSQLiteDriver())
                 .setQueryCoroutineContext(Dispatchers.IO)
-                .addMigrations(MIGRATION_1_2)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 .build()
+
+        /** Adds the artists the user picked when asked what they like. */
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(connection: SQLiteConnection) {
+                connection.execSQL("CREATE TABLE IF NOT EXISTS `taste_pick` (`artistKey` TEXT NOT NULL, `name` TEXT NOT NULL, `thumbnail` TEXT NOT NULL, `pickedAt` INTEGER NOT NULL, PRIMARY KEY(`artistKey`))")
+            }
+        }
 
         /** Adds the recommendation tables. SQL copied from Room's generated schema so validation passes. */
         val MIGRATION_1_2 = object : Migration(1, 2) {

@@ -19,6 +19,9 @@ interface CandidateSource {
 
     /** Recent tracks by an artist (newest releases first). */
     suspend fun recentReleases(artistId: String): List<SongItem>
+
+    /** An artist's best-known songs (what their page lists first), most popular first. */
+    suspend fun topSongs(artistId: String): List<SongItem> = emptyList()
 }
 
 /** YouTube Music candidates, cached in the database so rebuilding mixes doesn't refetch. */
@@ -52,6 +55,17 @@ class YouTubeCandidates(private val library: LibraryRepository) : CandidateSourc
             }
         }
         library.cacheRelated(key, songs)
+        return songs
+    }
+
+    /** The "Top songs" shelf of the artist's page, cached for a month (it barely changes). */
+    override suspend fun topSongs(artistId: String): List<SongItem> {
+        val key = "picktop:$artistId"
+        library.cachedRelated(key, maxAgeDays = 30)?.let { return it }
+        polite()
+        val page = YouTube.artist(artistId).getOrNull() ?: return emptyList()
+        val songs = page.sections.firstOrNull { s -> s.items.any { it is SongItem } }?.items?.filterIsInstance<SongItem>().orEmpty().take(5)
+        if (songs.isNotEmpty()) library.cacheRelated(key, songs) // a failed fetch must not stick
         return songs
     }
 

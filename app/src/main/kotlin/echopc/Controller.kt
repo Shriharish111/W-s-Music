@@ -4,6 +4,7 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -24,6 +25,7 @@ import echopc.db.artistKey
 import echopc.db.GeneratedMix
 import echopc.db.LibraryRepository
 import echopc.db.StartReason
+import echopc.db.TastePick
 import echopc.db.TrackCodec
 import echopc.reco.CandidateSource
 import echopc.reco.MixKind
@@ -51,6 +53,8 @@ sealed interface Route {
     data class LocalPlaylist(val id: String) : Route
     /** A generated mix (Daily Mix, Discover Weekly, ...). */
     data class Mix(val id: String) : Route
+    /** "Tell us what you like": pick artists to seed taste. */
+    data object Picker : Route
     /** An online playlist / album / mood page; its content lives in [Controller.details] under [key]. */
     data class Online(val key: String) : Route
 }
@@ -66,6 +70,7 @@ fun routeContext(r: Route): String = when (r) {
     is Route.LocalPlaylist -> "local:${r.id}"
     is Route.Online -> r.key
     is Route.Mix -> "mix:${r.id}"
+    Route.Picker -> "picker"
 }
 
 /** What the user asked us to avoid, as quick lookups (from the `feedback` table). */
@@ -91,6 +96,23 @@ data class Blocks(
 
 /** A toast's button, e.g. Undo. */
 class ToastAction(val label: String, val run: () -> Unit)
+
+/**
+ * What went wrong, in words for a person. YouTube's errors arrive as raw HTTP and JSON text, which must never reach the screen.
+ * Sentence-case and without a trailing full stop, so callers can add their own advice after it.
+ */
+fun friendlyError(t: Throwable): String {
+    // Class names count too: an UnknownHostException's message is only the host name.
+    val text = generateSequence(t) { it.cause }.joinToString(" ") { "${it::class.simpleName} ${it.message.orEmpty()}" }.lowercase()
+    return when {
+        listOf("unknownhost", "connectexception", "unable to resolve", "no address associated", "network is unreachable", "no route to host", "connection refused", "failed to connect", "connect timed out", "unresolved")
+            .any { it in text } -> "There's no internet connection"
+        listOf("429", "too many requests", "quota").any { it in text } -> "YouTube Music is busy right now"
+        listOf("500", "502", "503", "504", "unavailable", "backenderror", "bad gateway").any { it in text } -> "YouTube Music is temporarily unavailable"
+        "timeout" in text || "timed out" in text -> "The connection is too slow right now"
+        else -> "Something went wrong loading this"
+    }
+}
 
 /** What the right-hand panel shows. */
 enum class PanelTab { NOW_PLAYING, QUEUE }
@@ -144,6 +166,7 @@ class Controller(
     val library: LibraryRepository,
     private val settingsFile: File? = null,
     recoSource: CandidateSource? = null,
+    discoverySource: DiscoverySource? = null,
     engineFactory: (onState: (PlayerState) -> Unit, onEnded: () -> Unit) -> PlayerEngine,
 ) {
     // ---- navigation ----
@@ -204,6 +227,25 @@ class Controller(
     private var shelfOrder: List<String> = emptyList()
     private val shelfImpressions = HashSet<String>()
 
+    // ---- new users: popular songs and picking artists ----
+    val discovery: DiscoverySource = discoverySource ?: YouTubeDiscovery(library)
+    var popularNow by mutableStateOf<PopularNow?>(null)
+    var popularLoading by mutableStateOf(false)
+        private set
+    var tastePicks by mutableStateOf<List<TastePick>>(emptyList())
+    /** "Not now" (or a finished pick) on the Home card; remembered across launches. */
+    var tastePromptDismissed by mutableStateOf(false)
+    var suggestedArtists by mutableStateOf<List<ArtistItem>>(emptyList())
+    var suggestedLoading by mutableStateOf(false)
+    val pickerSelected = mutableStateListOf<ArtistItem>()
+    var pickerSimilar by mutableStateOf<List<ArtistItem>>(emptyList())
+    var pickerQuery by mutableStateOf("")
+    var pickerResults by mutableStateOf<List<ArtistItem>>(emptyList())
+    var pickerSearching by mutableStateOf(false)
+    private var pickerSearchJob: Job? = null
+    /** False until the stored mixes have been read once, so Home doesn't treat "not loaded yet" as "no mixes". */
+    var mixesLoaded by mutableStateOf(false)
+
     // ---- keyboard shortcuts ----
     var shortcutsOpen by mutableStateOf(false)
     /** Bumped by Ctrl+L; the search box focuses itself when it changes. */
@@ -237,7 +279,14 @@ class Controller(
         loadSettings()
         engine.setVolume(volume.toDouble())
         scope.launch { library.likedIds.collect { likedIds = it.toSet() } }
-        scope.launch { library.mixes.collect { mixes = it } }
+        scope.launch {
+            library.mixes.collect {
+                mixes = it; mixesLoaded = true
+                // No mixes yet: Home needs something to show. Start the popular songs (and the picker's artists) right away.
+                if (it.isEmpty()) { loadPopular(); if (!tastePromptDismissed) prefetchSuggestedArtists() }
+            }
+        }
+        scope.launch { library.tastePicks.collect { tastePicks = it } }
         scope.launch { library.feedback.collect { blocks = Blocks.from(it) } }
         scope.launch { loadShelfStats() }
         scope.launch(Dispatchers.IO) { for (write in playLog) runCatching { write() } }
@@ -591,18 +640,34 @@ class Controller(
         shelfOrder = emptyList(); shelfImpressions.clear()
         scope.launch { loadShelfStats() }
         homeLoading = true; homeError = null
+        homeRetryJob?.cancel()
         scope.launch {
             YouTube.home(browseId = chip?.endpoint?.browseId ?: "FEmusic_home", params = chip?.endpoint?.params)
                 .onSuccess { page ->
                     homeSections = page.sections
                     homeMore = page.continuation
                     if (!page.chips.isNullOrEmpty()) homeChips = page.chips!!
+                    homeRetries = 0
+                    if (mixesLoaded && mixes.isEmpty()) loadPopular() // the connection is back: fill any gap
                 }
-                .onFailure { homeError = it.message ?: "Couldn't load the home feed" }
+                .onFailure { homeError = friendlyError(it); scheduleHomeRetry(chip) }
             homeLoading = false
         }
         if (newReleases.isEmpty() && moods.isEmpty()) scope.launch {
             YouTube.explore().onSuccess { e -> newReleases = e.newReleaseAlbums; moods = e.moodAndGenres }
+        }
+    }
+
+    private var homeRetryJob: Job? = null
+    private var homeRetries = 0
+
+    /** A failed feed tries again by itself (15 s, 30 s, 60 s, 2 min), so Home fills in as soon as YouTube is back. */
+    private fun scheduleHomeRetry(chip: HomePage.Chip?) {
+        if (homeRetries >= 4) return
+        val wait = 15_000L shl homeRetries++
+        homeRetryJob = scope.launch {
+            delay(wait)
+            if (homeSections.isEmpty()) loadHome(chip)
         }
     }
 
@@ -662,7 +727,7 @@ class Controller(
     private fun loadDetail(key: String, title: String, load: suspend () -> DetailUi) {
         details[key] = DetailUi.Loading(title)
         navigate(Route.Online(key))
-        scope.launch { details[key] = runCatching { load() }.getOrElse { DetailUi.Failed(title, it.message ?: "Couldn't open “$title”") } }
+        scope.launch { details[key] = runCatching { load() }.getOrElse { DetailUi.Failed(title, friendlyError(it)) } }
     }
 
     fun openPlaylist(p: PlaylistItem) = loadDetail("playlist:${p.id}", p.title) {
@@ -743,14 +808,98 @@ class Controller(
 
     /** Rebuilds whatever mixes are due (in the background); [force] rebuilds all of them. */
     fun refreshMixes(force: Boolean = false) {
-        if (mixesRefreshing) return
+        if (mixesRefreshing) { if (force) refreshAgain = true; return } // a forced rebuild waits for the running one
         mixesRefreshing = true
         signalsSinceRefresh = 0
         scope.launch(Dispatchers.IO) {
             runCatching { recommender.refresh(force) }.onFailure { println("[reco] refresh failed: ${it.message}") }
             mixesRefreshing = false
+            if (refreshAgain) { refreshAgain = false; refreshMixes(force = true) }
         }
     }
+    private var refreshAgain = false
+
+    // ---------------- new users: popular songs and picking artists ----------------
+
+    /** Loads "Popular right now" (YouTube Music's hit playlist) once; Home shows it until there are mixes. */
+    fun loadPopular() {
+        if (popularNow != null || popularLoading) return
+        popularLoading = true
+        scope.launch(Dispatchers.IO) {
+            // A flaky connection should not leave Home bare: try a few times before giving up.
+            for (attempt in 1..3) {
+                popularNow = runCatching { discovery.popularNow() }.getOrNull()
+                if (popularNow != null) break
+                delay(1_500L * attempt)
+            }
+            popularLoading = false
+        }
+    }
+
+    /** Opens the artist picker, with the current picks already selected. */
+    fun openPicker() {
+        pickerSelected.clear()
+        pickerSelected += tastePicks.map { ArtistItem(id = it.artistKey, title = it.name, thumbnail = it.thumbnail.ifBlank { null }, shuffleEndpoint = null, radioEndpoint = null) }
+        pickerQuery = ""; pickerResults = emptyList(); pickerSimilar = emptyList()
+        navigate(Route.Picker)
+        prefetchSuggestedArtists()
+    }
+
+    /** Looks up the picker's starter artists (about 5 s the first time), so Home can have them ready before anyone opens the picker. */
+    fun prefetchSuggestedArtists() {
+        if (suggestedArtists.isNotEmpty() || suggestedLoading) return
+        suggestedLoading = true
+        scope.launch(Dispatchers.IO) {
+            suggestedArtists = runCatching { discovery.suggestedArtists() }.getOrDefault(emptyList())
+            suggestedLoading = false
+        }
+    }
+
+    /** Picks or un-picks an artist; picking one suggests artists fans of it also like. */
+    fun togglePick(artist: ArtistItem) {
+        val at = pickerSelected.indexOfFirst { it.id == artist.id }
+        if (at >= 0) { pickerSelected.removeAt(at); return }
+        pickerSelected += artist
+        scope.launch(Dispatchers.IO) {
+            val similar = runCatching { discovery.similarArtists(artist.id) }.getOrDefault(emptyList())
+            val have = (pickerSelected.map { it.id } + pickerSimilar.map { it.id } + suggestedArtists.map { it.id }).toSet()
+            pickerSimilar = (pickerSimilar + similar.filter { it.id !in have }).take(24)
+        }
+    }
+
+    fun searchPickerArtists(query: String) {
+        pickerQuery = query
+        pickerSearchJob?.cancel()
+        if (query.isBlank()) { pickerResults = emptyList(); pickerSearching = false; return }
+        pickerSearching = true
+        pickerSearchJob = scope.launch(Dispatchers.IO) {
+            delay(300) // wait for a pause in typing
+            pickerResults = runCatching { discovery.searchArtists(query) }.getOrDefault(emptyList())
+            pickerSearching = false
+        }
+    }
+
+    /** Done: keep the picks, hide the Home card and build the first mixes from them right away. */
+    fun savePicks() {
+        if (pickerSelected.isEmpty()) return
+        val chosen = pickerSelected.toList()
+        tastePromptDismissed = true
+        scope.launch {
+            val now = java.time.LocalDateTime.now()
+            library.replaceTastePicks(chosen.map { TastePick(it.id, it.title, it.thumbnail.orEmpty(), now) })
+            recommender.invalidateEmpty()
+            refreshMixes(force = true)
+        }
+        showToast("Thanks! Building your first mixes now")
+        leavePicker()
+    }
+
+    /** Skip: nothing is saved; the Home card stays away. */
+    fun skipPicker() { tastePromptDismissed = true; leavePicker() }
+
+    fun dismissTastePrompt() { tastePromptDismissed = true }
+
+    private fun leavePicker() { if (route == Route.Picker) { if (canGoBack) goBack() else navigate(Route.Home) } }
 
     /** True while the taste-based mixes don't exist yet (a new user): worth trying again sooner. */
     private fun tasteMixesMissing() = listOf(MixKind.DAILY, MixKind.DISCOVER).any { k -> mixes.none { it.kind == k } }
@@ -802,7 +951,7 @@ class Controller(
             runCatching { library.rememberSearch(q) }
             YouTube.search(q, YouTube.SearchFilter.FILTER_SONG)
                 .onSuccess { r -> results = r.items.filterIsInstance<SongItem>() }
-                .onFailure { searchError = it.message ?: "Search failed" }
+                .onFailure { searchError = friendlyError(it) }
             searching = false
         }
     }
@@ -893,6 +1042,7 @@ class Controller(
             p.getProperty("panelTab")?.let { t -> PanelTab.entries.firstOrNull { it.name == t }?.let { panelTab = it } }
             p.getProperty("sidebarWidth")?.toFloatOrNull()?.let { sidebarWidth = it.coerceIn(SIDEBAR_MIN, SIDEBAR_MAX) }
             p.getProperty("sidebarCollapsed")?.let { sidebarCollapsed = it.toBoolean() }
+            p.getProperty("tastePromptDismissed")?.let { tastePromptDismissed = it.toBoolean() }
             p.stringPropertyNames().filter { it.startsWith("shuffle.") }.forEach { k ->
                 ShuffleMode.entries.firstOrNull { it.name == p.getProperty(k) }?.let { shuffleModes[k.removePrefix("shuffle.")] = it }
             }
@@ -908,6 +1058,7 @@ class Controller(
                 setProperty("panelOpen", panelOpen.toString()); setProperty("repeat", queue.repeat.name)
                 setProperty("panelTab", panelTab.name)
                 setProperty("sidebarWidth", sidebarWidth.toString()); setProperty("sidebarCollapsed", sidebarCollapsed.toString())
+                setProperty("tastePromptDismissed", tastePromptDismissed.toString())
                 shuffleModes.entries.take(200).forEach { (ctx, mode) -> setProperty("shuffle.$ctx", mode.name) }
             }.let { p -> f.outputStream().use { p.store(it, "W's MUSIC settings") } }
         }

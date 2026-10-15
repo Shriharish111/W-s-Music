@@ -40,7 +40,7 @@ class RecoFlowTest {
         LibraryDatabase.open(file).let { db -> LibraryRepository(db).toggleLike(s("keep", "Alpha")); db.close() }
         // Turn it back into a v1 file: no recommendation tables, schema version 1.
         BundledSQLiteDriver().open(file.absolutePath).let { conn ->
-            listOf("listen_signal", "feedback", "generated_mix", "related_cache", "shelf_stat").forEach { conn.execSQL("DROP TABLE `$it`") }
+            listOf("listen_signal", "feedback", "generated_mix", "related_cache", "shelf_stat", "taste_pick").forEach { conn.execSQL("DROP TABLE `$it`") }
             conn.execSQL("PRAGMA user_version = 1")
             conn.close()
         }

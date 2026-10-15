@@ -40,6 +40,15 @@ Plan: `D:\WMUSIC\PLAN.md`; client research notes: `D:\WMUSIC\_research\SPOTIFY_N
   icon button a hover label with its shortcut (above the button in the player bar, below elsewhere) and `Role.Button`;
   `HoverRow(menu = ...)` opens `SongMenuItems` at the pointer on right-click (song rows and queue rows).
   No auto-update: the app is a manually distributed Compose Desktop build (only the YouTube cipher config is fetched live).
+- **New users (done):** schema v3 adds `taste_pick` (`MIGRATION_2_3`). Home shows a "Tell us what you like" card (`TastePromptCard`)
+  and a labelled "Popular right now" shelf while there are no mixes; the picker is `TastePicker.kt` (`Route.Picker`).
+  Picks seed taste (`TasteProfile.build(pickSongs=...)`, `Weights.PICK_SONG`; top songs from `CandidateSource.topSongs`, cached
+  30 days) and force a mix rebuild. `Discovery.kt`: YouTube's charts page is EMPTY for anonymous visitors, so popular songs come
+  from YouTube Music's "The Hit List" playlist and picker artists from the artists on its hit playlists (photos via artist search);
+  cached 1 day / 7 days, with the last saved copy used when offline. Smoke: `gradlew :app:smoke -Pmain=echopc.PickerSmokeKt`.
+- **Home is never blank:** skeleton placeholders until something arrives; the feed retries itself (15 s, 30 s, 60 s, 2 min);
+  errors go through `friendlyError` (never raw server JSON); the popular songs load is started by `Controller` (not by a Compose
+  effect, which a background state write may not trigger) and retried 3 times. Not cached offline: the YouTube feed shelves.
   Test hygiene: tests must cancel+join their Controller scope (`TestScope.stop()`) before closing the DB, else the
   native SQLite crashes the test JVM; `Main.kt` does the same on window close.
 

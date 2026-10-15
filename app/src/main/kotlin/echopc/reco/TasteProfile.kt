@@ -16,6 +16,11 @@ object Weights {
     const val EARLY_SKIP = -0.7 // skipped forward before 30 s
     const val LIKE = 3.0
     const val PLAYLIST_ADD = 2.0
+    /**
+     * One song of a picked artist's top songs. A pick brings up to three of them (about 2.1 together, a little
+     * above a playlist add and below a like), a guess that real listening quickly outweighs.
+     */
+    const val PICK_SONG = 0.7
     const val NOT_INTERESTED = -5.0
     /** Listening to a song marked "exclude from taste" counts this much. */
     const val EXCLUDED_FACTOR = 0.1
@@ -103,7 +108,11 @@ class TasteProfile(
         tracks.values.filter { it.artistKey == artistKey && it.longScore > 0 && it.songId !in notInterested }.sortedByDescending { it.longScore }
 
     companion object {
-        fun build(plays: List<Play>, saved: List<Saved>, playlistSongs: List<Saved>, feedback: List<Feedback>, now: Long): TasteProfile {
+        fun build(
+            plays: List<Play>, saved: List<Saved>, playlistSongs: List<Saved>, feedback: List<Feedback>, now: Long,
+            /** Top songs of the artists the user picked when asked what they like. */
+            pickSongs: List<Saved> = emptyList(),
+        ): TasteProfile {
             val notInterested = feedback.filter { it.kind == Feedback.Kind.NOT_INTERESTED }.map { it.targetId }.toSet()
             val banned = feedback.filter { it.kind == Feedback.Kind.BAN_ARTIST }.map { it.targetId }.toSet()
             val excluded = feedback.filter { it.kind == Feedback.Kind.EXCLUDE_FROM_TASTE }.map { it.targetId }.toSet()
@@ -132,6 +141,7 @@ class TasteProfile(
             }
             for (s in saved) add(s.songId, s.artistKey, s.artistName, Weights.LIKE, s.atMillis?.let { now - it } ?: 0L)
             for (s in playlistSongs) add(s.songId, s.artistKey, s.artistName, Weights.PLAYLIST_ADD, (Weights.PLAYLIST_AGE_DAYS * 86_400_000).toLong())
+            for (s in pickSongs) add(s.songId, s.artistKey, s.artistName, Weights.PICK_SONG, s.atMillis?.let { now - it } ?: 0L)
             for (id in notInterested) tracks[id]?.let { t ->
                 add(id, t.artistKey, "", Weights.NOT_INTERESTED, 0L)
             }

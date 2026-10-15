@@ -131,7 +131,7 @@ class MixEngine(private val source: CandidateSource, private val songMeta: Map<S
         }.sortedByDescending { it.second }.map { byId.getValue(it.first) }
         val songs = capPerArtist(ranked, 2).take(size)
         if (songs.size < 10) return null
-        return MixDraft("discover-weekly", MixKind.DISCOVER, "Discover Weekly", "New-to-you songs picked from what you've been playing. Updated every Monday.", songs)
+        return MixDraft("discover-weekly", MixKind.DISCOVER, "Discover Weekly", "New-to-you songs picked from your taste. Updated every Monday.", songs)
     }
 
     // ---------------- Release Radar ----------------
@@ -150,7 +150,7 @@ class MixEngine(private val source: CandidateSource, private val songMeta: Map<S
         }
         if (songs.size > limit) songs.subList(limit, songs.size).clear()
         if (songs.size < 5) return null
-        return MixDraft("release-radar", MixKind.RADAR, "Release Radar", "New releases from artists you listen to. Updated every Friday.", songs)
+        return MixDraft("release-radar", MixKind.RADAR, "Release Radar", "New releases from artists you like. Updated every Friday.", songs)
     }
 
     // ---------------- On Repeat / Repeat Rewind ----------------

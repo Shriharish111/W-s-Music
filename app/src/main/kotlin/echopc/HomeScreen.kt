@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
@@ -43,6 +44,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -168,30 +170,37 @@ fun HomeScreen(c: Controller) {
 
     Box(Modifier.fillMaxSize().background(Brush.verticalGradient(0f to accent.flood.copy(alpha = 0.7f), 0.35f to Ws.surface))) {
         LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(32.dp), contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)) {
+            // A brand-new user (little listening, nothing picked) is asked what they like; meanwhile YouTube's popular
+            // songs fill the page. Decided here, inside the list content, which re-runs whenever this state changes.
+            // (The Controller starts the loads itself; the UI only shows what has arrived.)
+            val knownSongs = liked.size + recents.size
+            val promptVisible = !c.tastePromptDismissed && c.tastePicks.isEmpty() && knownSongs < NEW_USER_SONGS
+            val showPopular = c.mixesLoaded && c.mixes.isEmpty()
             item("chips") {
                 Row(Modifier.padding(horizontal = 24.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     WsChip("All", { if (c.homeChip != null) c.loadHome(null) }, selected = c.homeChip == null)
                     LazyRow(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         itemsIndexed(c.homeChips, key = { i, ch -> "$i-${ch.title}" }) { _, chip -> WsChip(chip.title, { c.selectChip(chip) }, selected = c.homeChip?.title == chip.title) }
                     }
-                    WsIconButton(Icons.Rounded.Refresh, "Refresh Home", { c.loadHome(c.homeChip) }, size = 32.dp, iconSize = 18.dp)
+                    WsIconButton(Icons.Rounded.Refresh, "Refresh Home", { c.loadHome(c.homeChip); c.loadPopular() }, size = 32.dp, iconSize = 18.dp)
                 }
             }
             item("quick") {
                 Column(Modifier.padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Text(greeting(), style = MaterialTheme.typography.headlineLarge, color = Ws.text)
-                    QuickTiles(c, playlists, recents, c.homeSections.firstOrNull()?.items)
-                }
-            }
-            when {
-                c.homeLoading && c.homeSections.isEmpty() && c.mixes.isEmpty() && recents.isEmpty() ->
-                    item("loading") { Column(verticalArrangement = Arrangement.spacedBy(32.dp)) { SkeletonShelf(); SkeletonShelf() } }
-                c.homeError != null && c.homeSections.isEmpty() -> item("error") {
-                    EmptyState("Couldn't reach YouTube Music", "${c.homeError}. Check your internet connection, then try again.") {
-                        PrimaryButton("Try again", { c.loadHome(c.homeChip) }, icon = Icons.Rounded.Refresh)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(greeting(), Modifier.weight(1f), style = MaterialTheme.typography.headlineLarge, color = Ws.text)
+                        // The card covers new users; everyone with little history (or existing picks) can still get to the picker.
+                        if (!promptVisible && (c.tastePicks.isNotEmpty() || knownSongs < ESTABLISHED_SONGS)) {
+                            OutlineButton(if (c.tastePicks.isEmpty()) "Choose artists you like" else "Edit your artists", { c.openPicker() })
+                        }
                     }
+                    QuickTiles(c, playlists, recents, c.homeSections.firstOrNull()?.items ?: c.popularNow?.songs)
                 }
             }
+            if (promptVisible) item("taste-prompt") { TastePromptCard(c) }
+            // Until the first mixes exist, YouTube's hit playlist fills the "Made for you" slot, labelled as what it is.
+            val popular = c.popularNow
+            if (showPopular && popular != null) item("popular-now") { PopularShelf(c, popular) }
             // Shelves in the order the bandit picked for this visit (see ShelfBandit).
             val shelves = LinkedHashMap<String, @Composable () -> Unit>()
             if (c.mixes.isNotEmpty() || seeds.isNotEmpty()) shelves["made-for-you"] = { MadeForYouShelf(c, seeds) }
@@ -215,6 +224,14 @@ fun HomeScreen(c: Controller) {
                     }
                 }
             }
+            // Home is never a blank page: while nothing has arrived there are placeholders, and if YouTube can't be reached
+            // the message says so, with a retry (whatever is saved on this PC, and the last popular songs, still show).
+            val somethingToShow = shelves.isNotEmpty() || (showPopular && popular != null) || c.homeSections.isNotEmpty()
+            if (c.homeError != null && c.homeSections.isEmpty()) item("error") {
+                EmptyState("Couldn't load YouTube Music", "${c.homeError}. We'll keep trying, or you can try again now.") {
+                    PrimaryButton("Try again", { c.loadHome(c.homeChip); c.loadPopular() }, icon = Icons.Rounded.Refresh)
+                }
+            } else if (!somethingToShow) item("loading") { Column(Modifier.testTag("home-placeholder"), verticalArrangement = Arrangement.spacedBy(32.dp)) { SkeletonShelf(); SkeletonShelf() } }
             for (key in c.orderShelves(shelves.keys.toList())) item("shelf-$key") {
                 LaunchedEffect(key) { c.noteShelfImpressions(listOf(key)) } // composed = on (or near) screen
                 shelves.getValue(key)()
@@ -229,6 +246,40 @@ fun HomeScreen(c: Controller) {
                 LaunchedEffect(c.homeMore) { c.loadMoreHome() } // only composed near the bottom: infinite scroll
                 Box(Modifier.fillMaxWidth().height(60.dp), contentAlignment = Alignment.Center) { MetaText("Loading more") }
             }
+        }
+    }
+}
+
+/** Home asks new users what they like while they have fewer known songs than this; the picker button stays until [ESTABLISHED_SONGS]. */
+private const val NEW_USER_SONGS = 5
+private const val ESTABLISHED_SONGS = 30
+
+/** "Tell us what you like": a card (not a blocking screen) that opens the artist picker. */
+@Composable
+private fun TastePromptCard(c: Controller) {
+    Column(
+        Modifier.padding(horizontal = 24.dp).fillMaxWidth().clip(RoundedCornerShape(8.dp))
+            .background(Brush.horizontalGradient(listOf(Ws.defaultAccent.copy(alpha = 0.55f), Ws.defaultAccent.copy(alpha = 0.18f)))).padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Tell us what you like", style = MaterialTheme.typography.headlineMedium, color = Ws.text)
+        Text(
+            "Pick a few artists and we'll build your first mixes right away. Your listening fine-tunes them from there.",
+            style = MaterialTheme.typography.bodyLarge, color = Ws.text.copy(alpha = 0.85f), modifier = Modifier.widthIn(max = 560.dp),
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            PrimaryButton("Pick artists", { c.openPicker() })
+            OutlineButton("Not now", { c.dismissTastePrompt() })
+        }
+    }
+}
+
+/** YouTube Music's hit playlist, shown while there are no mixes of your own. */
+@Composable
+private fun PopularShelf(c: Controller, popular: PopularNow) {
+    Shelf("Popular right now", "From “${popular.title}” on YouTube Music. Play and like songs and your own mixes will replace this.") {
+        itemsIndexed(popular.songs, key = { _, s -> "pop-${s.id}" }) { i, song ->
+            MediaCard(song.thumbnail, song.title, song.artists.joinToString { it.name }, { c.playFromList(popular.songs, i, context = "popular") })
         }
     }
 }
