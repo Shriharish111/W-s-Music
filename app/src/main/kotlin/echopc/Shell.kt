@@ -1,6 +1,7 @@
 package echopc
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.draggable
@@ -79,14 +80,22 @@ fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
             }
             PlayerBar(c)
         }
-        // Toast: just above the player bar, like a snackbar.
+        // Toast: just above the player bar, like a snackbar, optionally with an Undo button.
         c.toast?.let { message ->
-            Text(
-                message,
+            Row(
                 Modifier.align(Alignment.BottomCenter).padding(bottom = 96.dp)
-                    .clip(RoundedCornerShape(8.dp)).background(Ws.text).padding(horizontal = 16.dp, vertical = 10.dp),
-                style = MaterialTheme.typography.bodyMedium, color = Color.Black,
-            )
+                    .clip(RoundedCornerShape(8.dp)).background(Ws.text).padding(start = 16.dp, end = if (c.toastAction != null) 8.dp else 16.dp, top = 6.dp, bottom = 6.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(message, Modifier.padding(vertical = 4.dp), style = MaterialTheme.typography.bodyMedium, color = Color.Black)
+                c.toastAction?.let { action ->
+                    Text(
+                        action.label,
+                        Modifier.clip(RoundedCornerShape(50)).clickable { c.runToastAction() }.handCursor().padding(horizontal = 10.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelLarge, color = Color.Black,
+                    )
+                }
+            }
         }
         if (c.newPlaylistOpen) NameDialog("New playlist", "", "Create", onConfirm = c::createPlaylist, onDismiss = { c.newPlaylistOpen = false; c.newPlaylistFor = null })
         ImportDialog(c)

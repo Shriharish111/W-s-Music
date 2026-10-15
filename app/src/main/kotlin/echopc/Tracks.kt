@@ -28,7 +28,16 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PlaylistAdd
 import androidx.compose.material.icons.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Schedule
-import androidx.compose.material.icons.rounded.Shuffle
+import androidx.compose.material.icons.rounded.Block
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ThumbDown
+import androidx.compose.material.icons.rounded.ThumbUp
+import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.ui.draw.alpha
+import echopc.db.artistKey
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -100,10 +109,13 @@ fun CollectionPage(
                         val inList = c.queue.current?.id?.let { id -> songs.any { it.id == id } } == true
                         PlayButton(
                             playing = inList && c.playback.playing, loading = false, enabled = songs.isNotEmpty(),
-                            onClick = { if (inList) c.togglePause() else c.playFromList(songs, 0) },
+                            onClick = { if (inList) c.togglePause() else c.playCollection(songs) },
                             size = 56.dp, onAccent = true,
                         )
-                        WsIconButton(Icons.Rounded.Shuffle, "Shuffle play", { c.playShuffled(songs) }, size = 40.dp, iconSize = 28.dp, enabled = songs.isNotEmpty())
+                        val context = routeContext(c.route)
+                        val mode = c.shuffleMode(context)
+                        ShuffleButton(mode, shuffleActionLabel(mode, c.smartAvailable(context)), { c.cycleShuffle(context) }, size = 40.dp, iconSize = 28.dp, enabled = songs.isNotEmpty())
+                        if (mode == ShuffleMode.SMART) MetaText(if (c.smartLoading) "Finding recommendations" else "Smart Shuffle: recommendations mixed in")
                         actions()
                     }
                 }
@@ -193,8 +205,10 @@ fun TrackRow(
     val accent = LocalAccent.current
     val current = c.queue.current?.id == song.id
     val liked = song.id in c.likedIds
+    // Hidden here, not wanted, or by a blocked artist: shown dimmed and skipped when playing.
+    val blocked = c.blocks.blocked(song, routeContext(c.route))
     HoverRow({ c.playFromList(songs, index) }, selected = false) { hovered ->
-        Row(Modifier.height(56.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        Row(Modifier.height(56.dp).padding(horizontal = 16.dp).alpha(if (blocked) 0.4f else 1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             Box(Modifier.width(24.dp), contentAlignment = Alignment.CenterEnd) {
                 when {
                     hovered -> Icon(Icons.Rounded.PlayArrow, "Play", Modifier.size(18.dp), tint = Ws.text)
@@ -244,12 +258,34 @@ fun SongMenu(c: Controller, song: SongItem, visible: Boolean = true) {
                 MenuItem("Play next", Icons.Rounded.PlayArrow) { c.playNext(song); open = false }
                 MenuItem("Add to queue", Icons.Rounded.QueueMusic) { c.addToQueue(song); open = false }
                 MenuItem("Add to playlist", Icons.Rounded.PlaylistAdd) { inPlaylists = true }
+                HorizontalDivider(Modifier.padding(vertical = 4.dp), color = Ws.border)
+                FeedbackItems(c, song) { open = false }
             } else {
                 MenuItem("New playlist", Icons.Rounded.Add) { c.newPlaylistFor = song; c.newPlaylistOpen = true; open = false }
                 playlists.forEach { p -> MenuItem(p.playlist.name, Icons.Rounded.MusicNote) { c.addToPlaylist(p.playlist.id, song); open = false } }
             }
         }
     }
+}
+
+/** "Tell the recommender" items: each one has an inverse when it's already set. */
+@Composable
+private fun FeedbackItems(c: Controller, song: SongItem, close: () -> Unit) {
+    val context = routeContext(c.route)
+    val b = c.blocks
+    if (song.id in b.notInterested) MenuItem("Recommend this again", Icons.Rounded.ThumbUp) { c.recommendAgain(song); close() }
+    else MenuItem("Not interested", Icons.Rounded.ThumbDown) { c.notInterested(song); close() }
+    c.hideLabel(context)?.let { label ->
+        if (song.id in b.hidden[context].orEmpty()) MenuItem("Show in this list again", Icons.Rounded.Visibility) { c.unhideInContext(song, context); close() }
+        else MenuItem(label, Icons.Rounded.VisibilityOff) { c.hideInContext(song, context); close() }
+    }
+    val artist = song.artists.firstOrNull()?.name
+    if (artist != null) {
+        if (song.artistKey() in b.bannedArtists) MenuItem("Allow $artist to play", Icons.Rounded.CheckCircle) { c.allowArtist(song); close() }
+        else MenuItem("Don't play $artist", Icons.Rounded.Block) { c.banArtist(song); close() }
+    }
+    if (song.id in b.excluded) MenuItem("Include in your taste profile", Icons.Rounded.Tune) { c.toggleExcludeFromTaste(song); close() }
+    else MenuItem("Exclude from your taste profile", Icons.Rounded.Tune) { c.toggleExcludeFromTaste(song); close() }
 }
 
 @Composable

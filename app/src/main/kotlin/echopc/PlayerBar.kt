@@ -71,7 +71,8 @@ fun PlayerBar(c: Controller) {
         // ---- transport ----
         Column(Modifier.weight(0.4f).widthIn(max = 720.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                WsIconButton(Icons.Rounded.Shuffle, "Shuffle the queue", { c.shuffleQueue() }, size = 32.dp, iconSize = 18.dp, enabled = c.queue.items.size > 1)
+                val mode = c.shuffleMode()
+                ShuffleButton(mode, shuffleActionLabel(mode, c.smartAvailable(c.queueContext)), { c.cycleShuffle() }, enabled = c.queue.items.size > 1)
                 WsIconButton(Icons.Rounded.SkipPrevious, "Previous", { c.skipPrevious() }, enabled = has, size = 32.dp, iconSize = 24.dp)
                 PlayButton(c.playback.playing, c.playback.loading, has && c.playback.durationMs > 0 || c.playback.loading, { c.togglePause() }, size = 32.dp)
                 WsIconButton(Icons.Rounded.SkipNext, "Next", { c.skipNext() }, enabled = has, size = 32.dp, iconSize = 24.dp)

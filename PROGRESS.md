@@ -21,7 +21,14 @@ Plan: `D:\WMUSIC\PLAN.md`; client research notes: `D:\WMUSIC\_research\SPOTIFY_N
   propagation, Discover Weekly co-occurrence, Release Radar, On Repeat, Repeat Rewind), `ShelfBandit` (Thompson
   sampling for Home shelf order), `Recommender` (schedule: daily / Monday / Friday, cached YouTube radio).
   Smoke: `gradlew :app:smoke -Pmain=echopc.RecoSmokeKt` builds real mixes in a temp DB (~25 s).
-- **Phase 4 (next):** Smart Shuffle and feedback menu items (hide song, not interested, ban artist, exclude from taste).
+- **Phase 4 (done):** per-playlist shuffle mode OFF -> ON -> SMART (`Controller.cycleShuffle`, saved in settings).
+  Smart Shuffle = shuffle + one recommendation after every 3 songs (`QueueState.withSmartShuffle`,
+  `Recommender.smartShuffle`: co-occurrence over a sample of the page's songs, cached per page per day); queue rows
+  show a sparkle with Remove (hides it for that page) and, in your own playlists, Add to playlist.
+  Song menu: Not interested, Hide from this playlist/mix/album, Don't play <artist>, Exclude from your taste profile
+  (each reversible; toast Undo). Hidden / blocked songs are dimmed and skipped by `startCurrent`.
+  Test hygiene: tests must cancel+join their Controller scope (`TestScope.stop()`) before closing the DB, else the
+  native SQLite crashes the test JVM; `Main.kt` does the same on window close.
 
 ## Stream playback (important background)
 YouTube refuses anonymous stream URLs for most clients. What works today: InnerTubeX (`innertubex` 0.7.2)

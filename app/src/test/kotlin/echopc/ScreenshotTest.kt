@@ -11,6 +11,7 @@ import com.music.innertube.models.Album
 import com.music.innertube.models.Artist
 import com.music.innertube.models.SongItem
 import echopc.db.LibraryDatabase
+import echopc.db.artistKey
 import echopc.db.LibraryRepository
 import echopc.lyrics.LyricsEntry
 import echopc.lyrics.WordTimestamp
@@ -57,7 +58,7 @@ class ScreenshotTest {
         val songs = realSongs()
         val db = LibraryDatabase.open(File.createTempFile("ws-shot", ".db").also { it.delete(); it.deleteOnExit() })
         val repo = LibraryRepository(db)
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val scope = TestScope()
         val c = Controller(scope, repo, null) { _, _ -> FakeEngine() }
 
         val p1 = runBlocking {
@@ -111,8 +112,18 @@ class ScreenshotTest {
         c.navigate(Route.LocalPlaylist(p1.id)); shot("5-playlist")
         c.navigate(Route.History); c.sidebarCollapsed = true; shot("6-history-collapsed")
         c.sidebarCollapsed = false
+        // Phase 4: Smart Shuffle in the queue and player bar, a hidden song dimmed, a toast with Undo.
+        c.shuffleModes["home"] = ShuffleMode.SMART
+        c.queue = QueueState(items = songs, index = 1, recommended = setOf(songs[3].id, songs[6].id))
+        c.panelOpen = true; c.panelTab = PanelTab.QUEUE
+        c.navigate(Route.Liked)
+        c.blocks = Blocks(notInterested = setOf(songs[2].id), bannedArtists = setOf(songs[4].artistKey()))
+        c.showToast("“${songs[2].title}” is hidden here", ToastAction("Undo") {})
+        shot("8-smart-queue-feedback")
+        c.shuffleModes.clear(); c.blocks = Blocks()
         c.navigate(Route.Search); c.results = emptyList(); c.query = ""; c.queue = QueueState(); c.playback = PlayerState(); c.positionMs = 0; c.lyrics = LyricsUiState.Idle
         shot("7-empty-state")
+        scope.stop()
         repo.close()
     }
 }

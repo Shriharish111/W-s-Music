@@ -1,6 +1,7 @@
 package echopc.reco
 
 import com.music.innertube.models.SongItem
+import echopc.db.Feedback
 import echopc.db.GeneratedMix
 import echopc.db.LibraryRepository
 import echopc.db.TrackCodec
@@ -10,6 +11,7 @@ import java.time.DayOfWeek
 import java.time.LocalDateTime
 import java.time.ZoneOffset
 import java.time.temporal.TemporalAdjusters
+import kotlin.random.Random
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -80,6 +82,41 @@ class Recommender(
 
     private fun MixDraft.toEntity(position: Int, now: LocalDateTime) =
         GeneratedMix(id, kind, title, subtitle, TrackCodec.encode(songs), position, now)
+
+    // ---------------- Smart Shuffle ----------------
+
+    /**
+     * Recommendations to mix into a playlist/page for Smart Shuffle: songs that the page's own songs
+     * point to (co-occurrence across a sample of them), not already on the page, nothing the user
+     * blocked or removed here. One set per page per day, like Spotify ("refreshed daily").
+     */
+    suspend fun smartShuffle(context: String, songs: List<SongItem>, count: Int): List<SongItem> {
+        val now = clock()
+        val feedback = library.feedbackNow()
+        val notInterested = feedback.filter { it.kind == Feedback.Kind.NOT_INTERESTED }.map { it.targetId }.toSet()
+        val banned = feedback.filter { it.kind == Feedback.Kind.BAN_ARTIST }.map { it.targetId }.toSet()
+        val hiddenHere = feedback.filter { it.kind == Feedback.Kind.HIDE_IN_CONTEXT && it.context == context }.map { it.targetId }.toSet()
+        val inList = songs.map { it.id }.toSet()
+        fun allowed(s: SongItem) = s.id !in inList && s.id !in notInterested && s.id !in hiddenHere && s.artistKey() !in banned
+
+        val key = "smart:$context:${now.toLocalDate()}"
+        library.cachedRelated(key, maxAgeDays = 1)?.let { cached -> return cached.filter(::allowed).take(count) }
+
+        val seeds = songs.shuffled(Random(now.toLocalDate().toEpochDay() * 31 + context.hashCode())).take(8)
+        val score = HashMap<String, Double>()
+        val byId = HashMap<String, SongItem>()
+        for (seed in seeds) {
+            val related = source.related(seed)
+            related.forEachIndexed { rank, cand ->
+                if (!allowed(cand)) return@forEachIndexed
+                score.merge(cand.id, 1.0 - rank.toDouble() / related.size, Double::plus)
+                byId[cand.id] = cand
+            }
+        }
+        val ranked = MixEngine.capPerArtist(score.entries.sortedByDescending { it.value }.map { byId.getValue(it.key) }, 2).take(maxOf(count, 30))
+        library.cacheRelated(key, ranked)
+        return ranked.take(count)
+    }
 
     // ---------------- inputs ----------------
 

@@ -32,7 +32,8 @@ class UiFlowTest {
     fun wholeLibraryFlow() = runDesktopComposeUiTest(width = 1340, height = 840, testTimeout = 4.minutes) {
         val repo = LibraryRepository(LibraryDatabase.open(tmp(".db")))
         val engine = FakeEngine()
-        val c = Controller(CoroutineScope(SupervisorJob() + Dispatchers.Default), repo, null) { _, _ -> engine }
+        val scope = TestScope()
+        val c = Controller(scope, repo, null) { _, _ -> engine }
         val songs = listOf(fakeSong(1, "Alpha Track", "Artist A"), fakeSong(2, "Beta Track", "Artist B"), fakeSong(3, "Gamma Track", "Artist C"))
         c.results = songs
         c.navigate(Route.Search) // the app opens on Home
@@ -91,6 +92,7 @@ class UiFlowTest {
         c.skipPrevious()
         assertEquals("fake2", c.queue.current?.id)
         c.cycleRepeat(); assertEquals(RepeatMode.ALL, c.queue.repeat)
+        scope.stop()
         repo.close()
     }
 
@@ -98,7 +100,8 @@ class UiFlowTest {
     fun homePage() = runDesktopComposeUiTest(width = 1340, height = 1700, testTimeout = 4.minutes) {
         val repo = LibraryRepository(LibraryDatabase.open(tmp(".db")))
         val engine = FakeEngine()
-        val c = Controller(CoroutineScope(SupervisorJob() + Dispatchers.Default), repo, null) { _, _ -> engine }
+        val scope = TestScope()
+        val c = Controller(scope, repo, null) { _, _ -> engine }
         val songs = listOf(fakeSong(1, "Alpha Track", "Artist A"), fakeSong(2, "Beta Track", "Artist B"))
         val playlist = PlaylistItem("PLx", "Chill Mix", com.music.innertube.models.Artist("Curator", null), "20 songs", null, null, null, null)
         c.homeSections = listOf(HomePage.Section("Fresh picks", "JUST FOR YOU", null, null, songs + playlist))
@@ -131,6 +134,7 @@ class UiFlowTest {
         // "Liked Songs" (quick tile or sidebar) opens the Liked Songs page.
         onAllNodesWithText("Liked Songs", substring = true)[0].performClick()
         waitUntil(conditionDescription = "home wait #10", timeoutMillis = 5_000L) { c.route == Route.Liked }
+        scope.stop()
         repo.close()
     }
 }

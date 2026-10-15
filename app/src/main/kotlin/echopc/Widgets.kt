@@ -20,7 +20,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.MoreHoriz
+import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.Icon
@@ -185,6 +187,32 @@ fun PlayButton(
         val glyph = when { loading -> Icons.Rounded.MoreHoriz; playing -> Icons.Rounded.Pause; else -> Icons.Rounded.PlayArrow }
         Icon(glyph, if (playing) "Pause" else "Play", Modifier.size(size * 0.58f), tint = ink)
     }
+}
+
+/**
+ * Three-state shuffle: grey (off), accent (shuffle), accent with a sparkle (Smart Shuffle).
+ * [description] says what a click will do.
+ */
+@Composable
+fun ShuffleButton(mode: ShuffleMode, description: String, onClick: () -> Unit, modifier: Modifier = Modifier, size: Dp = 32.dp, iconSize: Dp = 18.dp, enabled: Boolean = true) {
+    val accent = LocalAccent.current
+    Box(modifier.size(size)) {
+        WsIconButton(
+            Icons.Rounded.Shuffle, description, onClick, size = size, iconSize = iconSize, enabled = enabled,
+            tint = if (mode == ShuffleMode.OFF) Ws.muted else accent.highlight, hoverTint = if (mode == ShuffleMode.OFF) Ws.text else accent.primary,
+        )
+        if (mode == ShuffleMode.SMART) Icon(
+            Icons.Rounded.AutoAwesome, null,
+            Modifier.align(Alignment.TopEnd).size(iconSize * 0.55f), tint = accent.highlight,
+        )
+    }
+}
+
+/** What clicking a shuffle button does next, for its label. */
+fun shuffleActionLabel(mode: ShuffleMode, smartAvailable: Boolean): String = when (mode) {
+    ShuffleMode.OFF -> "Turn on shuffle"
+    ShuffleMode.ON -> if (smartAvailable) "Turn on Smart Shuffle" else "Turn off shuffle"
+    ShuffleMode.SMART -> "Turn off Smart Shuffle"
 }
 
 /** Filter chip. Selected = white with black text. */

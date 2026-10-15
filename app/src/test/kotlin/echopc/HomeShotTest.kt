@@ -26,7 +26,8 @@ class HomeShotTest {
     @Test
     fun renderHome() = runDesktopComposeUiTest(width = 1340, height = 1700, testTimeout = 6.minutes) {
         val repo = LibraryRepository(LibraryDatabase.open(File.createTempFile("ws-home", ".db").also { it.delete(); it.deleteOnExit() }))
-        val c = Controller(CoroutineScope(SupervisorJob() + Dispatchers.Default), repo, null) { _, _ -> FakeEngine() }
+        val scope = TestScope()
+        val c = Controller(scope, repo, null) { _, _ -> FakeEngine() }
         runBlocking {
             YouTube.visitorData().onSuccess { YouTube.visitorData = it }
             val songs = YouTube.search("synthwave gaming", YouTube.SearchFilter.FILTER_SONG).getOrThrow().items.filterIsInstance<SongItem>().take(8)
@@ -70,6 +71,7 @@ class HomeShotTest {
         while (detail() !is DetailUi.Songs && System.currentTimeMillis() - t1 < 40_000) Thread.sleep(200)
         println("DETAIL: ${(detail() as? DetailUi.Songs)?.let { "${it.title} / ${it.songs.size} songs" } ?: detail()}")
         shot("h2-detail")
+        scope.stop()
         repo.close()
     }
 }

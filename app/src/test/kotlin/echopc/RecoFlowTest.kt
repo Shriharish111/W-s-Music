@@ -56,7 +56,8 @@ class RecoFlowTest {
         val repo = LibraryRepository(LibraryDatabase.open(tmp()))
         lateinit var state: (PlayerState) -> Unit
         lateinit var ended: () -> Unit
-        val c = Controller(CoroutineScope(SupervisorJob() + Dispatchers.Default), repo, null, recoSource = Source(emptyMap())) { st, en -> state = st; ended = en; FakeEngine() }
+        val scope = TestScope()
+        val c = Controller(scope, repo, null, recoSource = Source(emptyMap())) { st, en -> state = st; ended = en; FakeEngine() }
         c.autoplay = false
         val songs = listOf(s("a", "Alpha"), s("b", "Beta"), s("c", "Gamma"))
 
@@ -76,6 +77,7 @@ class RecoFlowTest {
         assertEquals(listOf(200_000L, 4_000L), signals.map { it.playedMs })
         // History keeps only real listens (10 s+); the 4 s skip is a taste signal only.
         assertEquals(listOf("a"), repo.history().first().map { it.song.song.id })
+        scope.stop()
         repo.close()
     }
 

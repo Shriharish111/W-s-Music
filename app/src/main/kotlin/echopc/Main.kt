@@ -63,6 +63,9 @@ fun main() = application {
     Window(
         onCloseRequest = {
             controller.shutdown()
+            // Flow collectors keep querying; stop them before the database closes.
+            val job = scope.coroutineContext[kotlinx.coroutines.Job]
+            kotlinx.coroutines.runBlocking { job?.cancel(); job?.join() }
             library.close()
             exitApplication()
         },

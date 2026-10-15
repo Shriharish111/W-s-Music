@@ -20,7 +20,11 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AddCircleOutline
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.RemoveCircleOutline
+import androidx.compose.material3.Icon
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
@@ -210,6 +214,7 @@ private fun QueueView(c: Controller) {
                     WsIconButton(Icons.Rounded.Delete, "Clear the queue", { c.clearQueue() }, size = 32.dp, iconSize = 18.dp)
                 }
             }
+            if (c.smartLoading) item("smart-loading") { MetaText("Finding Smart Shuffle recommendations", Modifier.padding(start = 8.dp, bottom = 6.dp)) }
             itemsIndexed(upcoming, key = { _, v -> "q-${v.index}-${v.value.id}" }) { _, v -> QueueRow(c, v.value, v.index, current = false) }
         }
     }
@@ -223,14 +228,21 @@ private fun QueueSectionTitle(text: String, modifier: Modifier = Modifier) {
 @Composable
 private fun QueueRow(c: Controller, song: SongItem, index: Int, current: Boolean) {
     val accent = LocalAccent.current
+    val recommended = c.queue.isRecommended(index)
     HoverRow({ c.jumpTo(index) }) { hovered ->
         Row(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Thumb(song.thumbnail, 44.dp, corner = 4.dp, seed = song.title)
             Column(Modifier.weight(1f)) {
-                Text(song.title, style = MaterialTheme.typography.bodyLarge, color = if (current) accent.highlight else Ws.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (recommended) Icon(Icons.Rounded.AutoAwesome, "Smart Shuffle recommendation", Modifier.size(14.dp), tint = accent.highlight)
+                    Text(song.title, style = MaterialTheme.typography.bodyLarge, color = if (current) accent.highlight else Ws.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
                 Text(song.artists.joinToString { it.name }, style = MaterialTheme.typography.bodySmall, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            if (current) EqBars(c.playback.playing)
+            if (recommended && !current) {
+                if (c.canKeepRecommendations) WsIconButton(Icons.Rounded.AddCircleOutline, "Add to this playlist", { c.addRecommendationToPlaylist(index) }, size = 28.dp, iconSize = 18.dp, tint = Ws.text)
+                WsIconButton(Icons.Rounded.RemoveCircleOutline, "Remove recommendation", { c.removeRecommendation(index) }, size = 28.dp, iconSize = 18.dp, tint = Ws.text)
+            } else if (current) EqBars(c.playback.playing)
             else WsIconButton(
                 Icons.Rounded.Close, "Remove from queue", { c.removeFromQueue(index) }, size = 28.dp, iconSize = 16.dp,
                 tint = if (hovered) Ws.muted else androidx.compose.ui.graphics.Color.Transparent,

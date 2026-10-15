@@ -19,6 +19,8 @@ import com.music.innertube.pages.HomePage
 import com.music.innertube.pages.MoodAndGenres
 import echopc.db.ImportResult
 import echopc.db.EndReason
+import echopc.db.Feedback
+import echopc.db.artistKey
 import echopc.db.GeneratedMix
 import echopc.db.LibraryRepository
 import echopc.db.StartReason
@@ -64,6 +66,30 @@ fun routeContext(r: Route): String = when (r) {
     is Route.Online -> r.key
     is Route.Mix -> "mix:${r.id}"
 }
+
+/** What the user asked us to avoid, as quick lookups (from the `feedback` table). */
+data class Blocks(
+    val notInterested: Set<String> = emptySet(),
+    val bannedArtists: Set<String> = emptySet(),
+    val excluded: Set<String> = emptySet(),
+    val hidden: Map<String, Set<String>> = emptyMap(),
+) {
+    /** True when [song] must not play in [context] (or at all). */
+    fun blocked(song: SongItem, context: String): Boolean =
+        song.id in notInterested || song.artistKey() in bannedArtists || song.id in hidden[context].orEmpty()
+
+    companion object {
+        fun from(list: List<Feedback>) = Blocks(
+            notInterested = list.filter { it.kind == Feedback.Kind.NOT_INTERESTED }.map { it.targetId }.toSet(),
+            bannedArtists = list.filter { it.kind == Feedback.Kind.BAN_ARTIST }.map { it.targetId }.toSet(),
+            excluded = list.filter { it.kind == Feedback.Kind.EXCLUDE_FROM_TASTE }.map { it.targetId }.toSet(),
+            hidden = list.filter { it.kind == Feedback.Kind.HIDE_IN_CONTEXT }.groupBy({ it.context }, { it.targetId }).mapValues { it.value.toSet() },
+        )
+    }
+}
+
+/** A toast's button, e.g. Undo. */
+class ToastAction(val label: String, val run: () -> Unit)
 
 /** What the right-hand panel shows. */
 enum class PanelTab { NOW_PLAYING, QUEUE }
@@ -160,6 +186,7 @@ class Controller(
     var lyrics by mutableStateOf<LyricsUiState>(LyricsUiState.Idle)
     var accent by mutableStateOf(Accent(Ws.defaultAccent, Ws.defaultAccent2))
     var toast by mutableStateOf<String?>(null)
+    var toastAction by mutableStateOf<ToastAction?>(null)
     var importUi by mutableStateOf<ImportUi>(ImportUi.Idle)
     var likedIds by mutableStateOf<Set<String>>(emptySet())
     var newPlaylistFor by mutableStateOf<SongItem?>(null) // song to add once created
@@ -176,13 +203,22 @@ class Controller(
     private var shelfOrder: List<String> = emptyList()
     private val shelfImpressions = HashSet<String>()
 
+    // ---- feedback & shuffle ----
+    var blocks by mutableStateOf(Blocks())
+    /** Shuffle mode per play context (only non-OFF entries are kept). */
+    val shuffleModes = mutableStateMapOf<String, ShuffleMode>()
+    var smartLoading by mutableStateOf(false)
+    /** The list the current queue was started from, in its own order (for turning shuffle off). */
+    private var queueOriginal: List<SongItem> = emptyList()
+
     private val engine: PlayerEngine = engineFactory(::onEngineState, ::onEnded)
     private var playingSong: SongItem? = null
     private var playedMax = 0L
     private var playStartReason = StartReason.CLICK_ROW
     private var playContext = "home"
     /** Where the current queue came from ("liked", "local:<id>", "mix:<id>", ...); radio additions are "radio". */
-    private var queueContext = "home"
+    var queueContext = "home"
+        private set
     private val radioIds = HashSet<String>()
     /** Play logging: one worker runs the writes strictly in the order plays end. */
     private val playLog = kotlinx.coroutines.channels.Channel<suspend () -> Unit>(kotlinx.coroutines.channels.Channel.UNLIMITED)
@@ -195,6 +231,7 @@ class Controller(
         engine.setVolume(volume.toDouble())
         scope.launch { library.likedIds.collect { likedIds = it.toSet() } }
         scope.launch { library.mixes.collect { mixes = it } }
+        scope.launch { library.feedback.collect { blocks = Blocks.from(it) } }
         scope.launch { loadShelfStats() }
         scope.launch(Dispatchers.IO) { for (write in playLog) runCatching { write() } }
     }
@@ -235,16 +272,34 @@ class Controller(
     }
 
     /** Starts the queue's current song; [start] says why it starts, [ended] why the previous one stopped. */
-    fun startCurrent(start: String = StartReason.CLICK_ROW, ended: String = EndReason.NEW_SELECTION) {
+    fun startCurrent(start: String = StartReason.CLICK_ROW, ended: String = EndReason.NEW_SELECTION, backwards: Boolean = false) {
+        if (queue.current == null) return
+        // Hidden songs and blocked artists are passed over, like Spotify does.
+        val target = playableIndex(queue.index, backwards)
+        if (target == null) {
+            flushPlay(ended); engine.stop()
+            showToast("Nothing here can play: these songs are hidden or by artists you blocked")
+            return
+        }
+        if (target != queue.index) queue = queue.jump(target)
         val song = queue.current ?: return
         flushPlay(ended)
         playingSong = song
-        playStartReason = start
+        playStartReason = if (song.id in queue.recommended) StartReason.SMART_SHUFFLE else start
         playContext = if (song.id in radioIds) "radio" else queueContext
         positionMs = 0
         engine.play(song.id, queue.upNext?.id)
         if (queue.upNext == null && autoplay) extendWithRadio(song, thenPlayFirstNew = false, ended = ended)
         loadSideEffects(song)
+    }
+
+    /** First playable position from [from], searching forward (or backward first for Previous). */
+    private fun playableIndex(from: Int, backwards: Boolean): Int? {
+        val items = queue.items
+        if (from !in items.indices) return null
+        val forward = (from until items.size) + if (queue.repeat == RepeatMode.ALL) (0 until from).toList() else emptyList()
+        val order = if (backwards) (from downTo 0) + (from + 1 until items.size) else forward
+        return order.firstOrNull { !blocks.blocked(items[it], queueContext) }
     }
 
     private fun loadSideEffects(song: SongItem) {
@@ -259,7 +314,7 @@ class Controller(
 
     private fun extendWithRadio(after: SongItem, thenPlayFirstNew: Boolean, ended: String) {
         scope.launch {
-            val radio = fetchRadio(after).filter { r -> queue.items.none { it.id == r.id } }
+            val radio = fetchRadio(after).filter { r -> queue.items.none { it.id == r.id } && !blocks.blocked(r, "radio") }
             if (radio.isEmpty()) return@launch
             radioIds += radio.map { it.id }
             val firstNew = queue.items.size
@@ -280,7 +335,7 @@ class Controller(
 
     fun skipPrevious() {
         if (positionMs > 3000) { seek(0); return }
-        queue.previousIndex()?.let { queue = queue.jump(it); startCurrent(StartReason.BACK_BUTTON, EndReason.BACK_BUTTON) }
+        queue.previousIndex()?.let { queue = queue.jump(it); startCurrent(StartReason.BACK_BUTTON, EndReason.BACK_BUTTON, backwards = true) }
     }
 
     fun togglePause() = engine.togglePause()
@@ -291,10 +346,29 @@ class Controller(
     fun playFromList(list: List<SongItem>, index: Int, context: String = routeContext(route)) {
         queueContext = context
         radioIds.clear()
-        queue = queue.withItems(list, index)
+        queueOriginal = list
+        val mode = shuffleMode(context)
+        queue = queue.withItems(list, index).copy(recommended = emptySet())
+        if (mode != ShuffleMode.OFF && index in list.indices) {
+            // The song you picked plays first; everything else (including songs listed before it) is shuffled.
+            queue = queue.copy(items = listOf(list[index]) + list.filterIndexed { i, _ -> i != index }.shuffled(), index = 0)
+        }
         startCurrent()
+        if (mode == ShuffleMode.SMART) addSmartRecommendations()
     }
-    fun playShuffled(list: List<SongItem>) { if (list.isNotEmpty()) playFromList(list.shuffled(), 0) }
+
+    /** A page's big play button: from the top, or from a random song when shuffle is on for that page. */
+    fun playCollection(list: List<SongItem>, context: String = routeContext(route)) {
+        if (list.isEmpty()) return
+        playFromList(list, if (shuffleMode(context) == ShuffleMode.OFF) 0 else list.indices.random(), context)
+    }
+
+    fun playShuffled(list: List<SongItem>) {
+        if (list.isEmpty()) return
+        val ctx = routeContext(route)
+        if (shuffleMode(ctx) == ShuffleMode.OFF) shuffleModes[ctx] = ShuffleMode.ON
+        playCollection(list, ctx)
+    }
     fun jumpTo(index: Int) { queue = queue.jump(index); startCurrent() }
 
     fun addToQueue(song: SongItem) {
@@ -313,6 +387,143 @@ class Controller(
         flushPlay(EndReason.CLOSED); engine.stop(); queue = QueueState(); lyrics = LyricsUiState.Idle
         accent = Accent(Ws.defaultAccent, Ws.defaultAccent2)
     }
+    // ---------------- shuffle & Smart Shuffle ----------------
+
+    fun shuffleMode(context: String = queueContext): ShuffleMode = shuffleModes[context] ?: ShuffleMode.OFF
+
+    /** Smart Shuffle is for collections (playlists, albums, mixes, liked songs), not radio or search results. */
+    fun smartAvailable(context: String): Boolean =
+        context == "liked" || context == "library" || listOf("local:", "playlist:", "album:", "mix:").any { context.startsWith(it) }
+
+    /** Shuffle button: off -> shuffle -> Smart Shuffle -> off (Smart only where it applies). */
+    fun cycleShuffle(context: String = queueContext) {
+        val next = when (shuffleMode(context)) {
+            ShuffleMode.OFF -> ShuffleMode.ON
+            ShuffleMode.ON -> if (smartAvailable(context)) ShuffleMode.SMART else ShuffleMode.OFF
+            ShuffleMode.SMART -> ShuffleMode.OFF
+        }
+        setShuffle(context, next)
+    }
+
+    fun setShuffle(context: String, mode: ShuffleMode) {
+        if (mode == ShuffleMode.OFF) shuffleModes.remove(context) else shuffleModes[context] = mode
+        if (context != queueContext || queue.items.isEmpty()) return // applies next time this list plays
+        when (mode) {
+            ShuffleMode.OFF -> {
+                val had = queue.recommended.isNotEmpty()
+                queue = queue.linear(queueOriginal)
+                if (had) showToast("Removed Smart Shuffle recommendations")
+            }
+            ShuffleMode.ON -> queue = queue.withoutRecommendations().shuffledUpcoming()
+            ShuffleMode.SMART -> addSmartRecommendations()
+        }
+        queue.upNext?.let { engine.prefetch(it.id) }
+    }
+
+    /** Fetches today's recommendations for the current list and mixes them in (one after every three songs). */
+    private fun addSmartRecommendations() {
+        val ctx = queueContext
+        val songs = queueOriginal
+        smartLoading = true
+        scope.launch(Dispatchers.IO) {
+            val count = ((songs.size + 2) / 3).coerceIn(1, 30)
+            val recs = runCatching { recommender.smartShuffle(ctx, songs, count) }.getOrDefault(emptyList())
+            smartLoading = false
+            if (queueContext != ctx || shuffleMode(ctx) != ShuffleMode.SMART) return@launch
+            queue = queue.withSmartShuffle(recs.filter { !blocks.blocked(it, ctx) })
+            queue.upNext?.let { engine.prefetch(it.id) }
+            showToast(if (queue.recommended.isEmpty()) "No recommendations for this right now, so it's a plain shuffle" else "Added Smart Shuffle recommendations to the queue")
+        }
+    }
+
+    /** Queue row: drop a recommendation, and don't suggest it for this list again. */
+    fun removeRecommendation(position: Int) {
+        val song = queue.items.getOrNull(position)?.takeIf { it.id in queue.recommended } ?: return
+        val ctx = queueContext
+        queue = queue.remove(position).let { it.copy(recommended = it.recommended - song.id) }
+        scope.launch { library.addFeedback(song.id, Feedback.Kind.HIDE_IN_CONTEXT, ctx) }
+        showToast("Removed “${song.title}”")
+    }
+
+    /** Queue row: keep a recommendation by adding it to the playlist it was recommended for. */
+    fun addRecommendationToPlaylist(position: Int) {
+        val song = queue.items.getOrNull(position)?.takeIf { it.id in queue.recommended } ?: return
+        val playlistId = queueContext.removePrefix("local:").takeIf { queueContext.startsWith("local:") } ?: return
+        queue = queue.copy(recommended = queue.recommended - song.id)
+        queueOriginal = queueOriginal + song
+        scope.launch { library.addToPlaylist(playlistId, song); showToast("Added “${song.title}” to the playlist") }
+    }
+
+    /** True when the current queue's recommendations can be saved to a playlist (only your own playlists). */
+    val canKeepRecommendations: Boolean get() = queueContext.startsWith("local:")
+
+    // ---------------- feedback ----------------
+
+    fun notInterested(song: SongItem) {
+        scope.launch { library.addFeedback(song.id, Feedback.Kind.NOT_INTERESTED) }
+        queue = queue.withoutUpcoming { it.id == song.id }
+        showToast("You won't get “${song.title}” in recommendations", ToastAction("Undo") {
+            scope.launch { library.removeFeedback(song.id, Feedback.Kind.NOT_INTERESTED) }
+        })
+    }
+
+    /** Label for "hide here", or null where hiding makes no sense (search, history, Liked Songs...). */
+    fun hideLabel(context: String): String? = when {
+        context.startsWith("local:") || context.startsWith("playlist:") -> "Hide from this playlist"
+        context.startsWith("mix:") -> "Hide from this mix"
+        context.startsWith("album:") -> "Hide from this album"
+        else -> null
+    }
+
+    fun hideInContext(song: SongItem, context: String) {
+        scope.launch { library.addFeedback(song.id, Feedback.Kind.HIDE_IN_CONTEXT, context) }
+        if (queueContext == context) {
+            queue = queue.withoutUpcoming { it.id == song.id }
+            if (queue.current?.id == song.id) skipNext()
+        }
+        showToast("“${song.title}” is hidden here", ToastAction("Undo") {
+            scope.launch { library.removeFeedback(song.id, Feedback.Kind.HIDE_IN_CONTEXT, context) }
+        })
+    }
+
+    fun banArtist(song: SongItem) {
+        val key = song.artistKey()
+        val name = song.artists.firstOrNull()?.name ?: "this artist"
+        scope.launch { library.addFeedback(key, Feedback.Kind.BAN_ARTIST) }
+        queue = queue.withoutUpcoming { it.artistKey() == key }
+        if (queue.current?.artistKey() == key) skipNext()
+        showToast("We won't play $name", ToastAction("Undo") {
+            scope.launch { library.removeFeedback(key, Feedback.Kind.BAN_ARTIST) }
+        })
+    }
+
+    fun recommendAgain(song: SongItem) {
+        scope.launch { library.removeFeedback(song.id, Feedback.Kind.NOT_INTERESTED) }
+        showToast("“${song.title}” can be recommended again")
+    }
+
+    fun allowArtist(song: SongItem) {
+        scope.launch { library.removeFeedback(song.artistKey(), Feedback.Kind.BAN_ARTIST) }
+        showToast("${song.artists.firstOrNull()?.name ?: "This artist"} can play again")
+    }
+
+    fun unhideInContext(song: SongItem, context: String) {
+        scope.launch { library.removeFeedback(song.id, Feedback.Kind.HIDE_IN_CONTEXT, context) }
+        showToast("“${song.title}” is back")
+    }
+
+    fun toggleExcludeFromTaste(song: SongItem) {
+        if (song.id in blocks.excluded) {
+            scope.launch { library.removeFeedback(song.id, Feedback.Kind.EXCLUDE_FROM_TASTE) }
+            showToast("“${song.title}” counts toward your taste again")
+        } else {
+            scope.launch { library.addFeedback(song.id, Feedback.Kind.EXCLUDE_FROM_TASTE) }
+            showToast("“${song.title}” will barely affect your recommendations", ToastAction("Undo") {
+                scope.launch { library.removeFeedback(song.id, Feedback.Kind.EXCLUDE_FROM_TASTE) }
+            })
+        }
+    }
+
     fun cycleRepeat() { queue = queue.copy(repeat = RepeatMode.entries[(queue.repeat.ordinal + 1) % RepeatMode.entries.size]) }
 
     // ---------------- home feed ----------------
@@ -561,10 +772,18 @@ class Controller(
         }
     }
 
-    fun showToast(text: String) {
+    fun showToast(text: String, action: ToastAction? = null) {
         toast = text
+        toastAction = action
         toastJob?.cancel()
-        toastJob = scope.launch { delay(2400); toast = null }
+        toastJob = scope.launch { delay(if (action != null) 5000 else 2400); toast = null; toastAction = null }
+    }
+
+    /** The toast's button was clicked. */
+    fun runToastAction() {
+        val action = toastAction ?: return
+        toast = null; toastAction = null; toastJob?.cancel()
+        action.run()
     }
 
     // ---------------- lifecycle ----------------
@@ -604,6 +823,9 @@ class Controller(
             p.getProperty("panelTab")?.let { t -> PanelTab.entries.firstOrNull { it.name == t }?.let { panelTab = it } }
             p.getProperty("sidebarWidth")?.toFloatOrNull()?.let { sidebarWidth = it.coerceIn(SIDEBAR_MIN, SIDEBAR_MAX) }
             p.getProperty("sidebarCollapsed")?.let { sidebarCollapsed = it.toBoolean() }
+            p.stringPropertyNames().filter { it.startsWith("shuffle.") }.forEach { k ->
+                ShuffleMode.entries.firstOrNull { it.name == p.getProperty(k) }?.let { shuffleModes[k.removePrefix("shuffle.")] = it }
+            }
         }
     }
 
@@ -616,6 +838,7 @@ class Controller(
                 setProperty("panelOpen", panelOpen.toString()); setProperty("repeat", queue.repeat.name)
                 setProperty("panelTab", panelTab.name)
                 setProperty("sidebarWidth", sidebarWidth.toString()); setProperty("sidebarCollapsed", sidebarCollapsed.toString())
+                shuffleModes.entries.take(200).forEach { (ctx, mode) -> setProperty("shuffle.$ctx", mode.name) }
             }.let { p -> f.outputStream().use { p.store(it, "W's MUSIC settings") } }
         }
     }
