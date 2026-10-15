@@ -33,6 +33,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Keyboard
+import androidx.compose.material.icons.rounded.SystemUpdateAlt
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -67,6 +68,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.awt.Cursor
 
@@ -121,6 +123,7 @@ fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
             }
         }
         if (c.shortcutsOpen) ShortcutsDialog { c.shortcutsOpen = false }
+        if (c.updateDialogOpen) UpdateDialog(c)
         if (c.newPlaylistOpen) NameDialog("New playlist", "", "Create", onConfirm = c::createPlaylist, onDismiss = { c.newPlaylistOpen = false; c.newPlaylistFor = null })
         ImportDialog(c)
     }
@@ -195,6 +198,12 @@ private fun TopBar(c: Controller, onPickAndroidFile: () -> Unit) {
             TopSearch(c)
         }
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End)) {
+            val pending = c.update
+            WsIconButton(
+                Icons.Rounded.SystemUpdateAlt, if (pending != null) "Update available: version ${pending.version}" else "Check for updates",
+                { if (pending != null) c.updateDialogOpen = true else c.checkForUpdates(manual = true) },
+                size = 32.dp, iconSize = 20.dp, tint = if (pending != null) LocalAccent.current.highlight else Ws.muted,
+            )
             WsIconButton(Icons.Rounded.Keyboard, "Keyboard shortcuts", { c.shortcutsOpen = true }, size = 32.dp, iconSize = 20.dp, shortcut = Shortcut.HELP.keys)
             WsIconButton(Icons.Rounded.FileUpload, "Import from the Android app", onPickAndroidFile, size = 32.dp, iconSize = 18.dp)
         }
@@ -245,6 +254,36 @@ private fun TopSearch(c: Controller) {
 // =====================================================================================
 //  Dialogs
 // =====================================================================================
+
+/** "A newer version is available": what it is, where it comes from, and one button to install it. */
+@Composable
+fun UpdateDialog(c: Controller) {
+    val info = c.update ?: return
+    val busy = c.updateProgress != null
+    AlertDialog(
+        onDismissRequest = { if (!busy) c.updateDialogOpen = false },
+        containerColor = Ws.surfaceHi, shape = RoundedCornerShape(8.dp),
+        title = { Text("Update available", style = MaterialTheme.typography.headlineMedium, color = Ws.text) },
+        text = { UpdateDialogBody(c, info) },
+        confirmButton = { PrimaryButton(if (c.updateError != null) "Try again" else "Update now", { c.installUpdate() }, enabled = !busy) },
+        dismissButton = { OutlineButton("Not now", { c.updateDialogOpen = false }, enabled = !busy) },
+    )
+}
+
+/** The words and progress bar of the update dialog (separate so it can be tested without opening a dialog window). */
+@Composable
+internal fun UpdateDialogBody(c: Controller, info: UpdateInfo) {
+    Column(Modifier.widthIn(min = 380.dp, max = 520.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Version ${info.version} is ready (you have ${Updater.currentVersion()}).", style = MaterialTheme.typography.bodyLarge, color = Ws.text)
+        if (info.notes.isNotBlank()) Text(info.notes.take(400), style = MaterialTheme.typography.bodyMedium, color = Ws.muted, maxLines = 8, overflow = TextOverflow.Ellipsis)
+        Text("W's MUSIC closes, the installer opens, and your library, likes and settings are kept. From ${info.repo} on GitHub.", style = MaterialTheme.typography.bodySmall, color = Ws.muted)
+        c.updateProgress?.let { p ->
+            androidx.compose.material3.LinearProgressIndicator(progress = { p }, Modifier.fillMaxWidth(), color = LocalAccent.current.highlight, trackColor = Ws.surfaceTop)
+            Text("Downloading… ${(p * 100).toInt()}%", style = MaterialTheme.typography.bodySmall, color = Ws.muted)
+        }
+        c.updateError?.let { Text("Update failed: $it", style = MaterialTheme.typography.bodyMedium, color = Ws.danger) }
+    }
+}
 
 /** All keyboard shortcuts, grouped, from the same table the key handling uses. */
 @Composable

@@ -224,6 +224,14 @@ class Controller(
     var tabMore by mutableStateOf(false)
     private var tabContinuation: String? = null
     private val tabCache = HashMap<SearchTab, Pair<List<YTItem>, String?>>()
+    // ---- self-update ----
+    var update by mutableStateOf<UpdateInfo?>(null)
+    var updateDialogOpen by mutableStateOf(false)
+    var updateProgress by mutableStateOf<Float?>(null)   // 0..1 while the installer downloads
+    var updateError by mutableStateOf<String?>(null)
+    /** Set by the window: closes the app (saving everything) so the installer can replace it. */
+    var requestExit: (() -> Unit)? = null
+
     private var searchedQuery = ""
     /** What the last finished search was for; the typing view shows while the box differs from it. */
     var lastSearched by mutableStateOf("")
@@ -1129,6 +1137,36 @@ class Controller(
     }
 
     // ---------------- lifecycle ----------------
+
+    /** Looks for a newer release (on start; [manual] from the top bar button also says when there is none). */
+    fun checkForUpdates(manual: Boolean = false) {
+        scope.launch(Dispatchers.IO) {
+            val found = runCatching { Updater.check() }.onFailure { Device.log("Update check failed: ${it.message?.take(120)}") }.getOrNull()
+            if (found != null) { update = found; updateDialogOpen = true }
+            else if (manual) showToast("You're up to date (version ${Updater.currentVersion()})")
+        }
+    }
+
+    /** Downloads the installer, checks it, starts it and closes the app. */
+    fun installUpdate() {
+        val info = update ?: return
+        if (updateProgress != null) return
+        updateError = null; updateProgress = 0f
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                val file = Updater.download(info) { updateProgress = it }
+                Device.log("Update ${info.version} downloaded from ${info.repo}; starting the installer.")
+                Updater.launchInstaller(file)
+            }.onSuccess {
+                updateProgress = null
+                requestExit?.invoke()
+            }.onFailure {
+                Device.log("Update ${info.version} failed: ${it.message?.take(160)}")
+                updateProgress = null
+                updateError = it.message?.take(140) ?: "The update could not be downloaded"
+            }
+        }
+    }
 
     /** Warms up the stream resolver so the first song starts sooner. */
     fun warmUp() {
