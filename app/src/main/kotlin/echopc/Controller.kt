@@ -975,13 +975,14 @@ class Controller(
             YouTube.searchSummary(q)
                 .onSuccess { page ->
                     if (gen != searchGeneration) return@launch
-                    searchSummaries = page.summaries
-                    results = page.summaries.flatMap { it.items }.filterIsInstance<SongItem>().distinctBy { it.id }
+                    val ranked = SearchRank.apply(q, page.summaries) // the song that was typed first, not a video or cover of it
+                    searchSummaries = ranked.summaries
+                    results = ranked.songs
                 }
                 .onFailure { failure = it }
             if (failure != null) { // the mixed page failed: fall back to the plain song list so search still works
                 YouTube.search(q, YouTube.SearchFilter.FILTER_SONG)
-                    .onSuccess { r -> if (gen != searchGeneration) return@launch; searchSummaries = emptyList(); results = r.items.filterIsInstance<SongItem>(); failure = null }
+                    .onSuccess { r -> if (gen != searchGeneration) return@launch; searchSummaries = emptyList(); results = SearchRank.rank(q, r.items.filterIsInstance<SongItem>()); failure = null }
                     .onFailure { failure = it }
             }
             if (gen != searchGeneration) return@launch
@@ -1014,7 +1015,9 @@ class Controller(
                 YouTube.search(q, f).onSuccess { items += it.items; cont = it.continuation }.onFailure { failed = true }
             }
             if (gen != searchGeneration || tab != searchTab) return@launch
-            val unique = items.distinctBy { it.id }
+            val unique = items.distinctBy { it.id }.let { list ->
+                if (tab == SearchTab.Songs || tab == SearchTab.Videos) SearchRank.rank(q, list.filterIsInstance<SongItem>()) else list
+            }
             if (failed && unique.isEmpty()) showToast("Couldn't load ${tab.label.lowercase()}. Check your connection.") else tabCache[tab] = unique to cont
             tabItems = unique; tabContinuation = cont; tabMore = cont != null; tabLoading = false
         }
