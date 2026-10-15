@@ -26,6 +26,7 @@ import echopc.db.LibraryRepository
 import echopc.db.StartReason
 import echopc.db.TrackCodec
 import echopc.reco.CandidateSource
+import echopc.reco.MixKind
 import echopc.reco.Recommender
 import echopc.reco.ShelfBandit
 import echopc.reco.YouTubeCandidates
@@ -432,7 +433,14 @@ class Controller(
             if (queueContext != ctx || shuffleMode(ctx) != ShuffleMode.SMART) return@launch
             queue = queue.withSmartShuffle(recs.filter { !blocks.blocked(it, ctx) })
             queue.upNext?.let { engine.prefetch(it.id) }
-            showToast(if (queue.recommended.isEmpty()) "No recommendations for this right now, so it's a plain shuffle" else "Added Smart Shuffle recommendations to the queue")
+            val added = queue.recommended.size
+            showToast(
+                when (added) {
+                    0 -> "Couldn't find Smart Shuffle recommendations right now, so this is a plain shuffle"
+                    1 -> "Added 1 Smart Shuffle recommendation to the queue"
+                    else -> "Added $added Smart Shuffle recommendations to the queue"
+                },
+            )
         }
     }
 
@@ -695,9 +703,13 @@ class Controller(
         }
     }
 
+    /** True while the taste-based mixes don't exist yet (a new user): worth trying again sooner. */
+    private fun tasteMixesMissing() = listOf(MixKind.DAILY, MixKind.DISCOVER).any { k -> mixes.none { it.kind == k } }
+
     private fun onSignalRecorded() {
-        // Plenty of new listening: let the daily mixes catch up without waiting for tomorrow.
-        if (++signalsSinceRefresh >= 20) refreshMixes()
+        // Plenty of new listening: let the mixes catch up without waiting for tomorrow. A user who has
+        // no taste mixes yet gets them after just a few plays.
+        if (++signalsSinceRefresh >= (if (tasteMixesMissing()) Recommender.RETRY_AFTER_SIGNALS else 20)) refreshMixes()
     }
 
     fun mixSongs(mix: GeneratedMix): List<SongItem> = TrackCodec.decode(mix.songs)
@@ -748,7 +760,12 @@ class Controller(
 
     // ---------------- library ----------------
 
-    fun toggleLike(song: SongItem) { scope.launch { library.toggleLike(song) } }
+    fun toggleLike(song: SongItem) {
+        scope.launch {
+            library.toggleLike(song)
+            if (tasteMixesMissing()) refreshMixes() // the first likes are enough to start Discover Weekly
+        }
+    }
 
     fun addToPlaylist(playlistId: String, song: SongItem) {
         scope.launch { showToast(if (library.addToPlaylist(playlistId, song)) "Added to playlist" else "Already in that playlist") }
@@ -769,6 +786,10 @@ class Controller(
         scope.launch {
             importUi = runCatching { library.importAndroid(file) }
                 .fold({ ImportUi.Done(it) }, { ImportUi.Failed(it.message ?: it.toString()) })
+            if (importUi is ImportUi.Done) { // imported likes, playlists and plays change taste a lot
+                recommender.invalidateEmpty()
+                refreshMixes(force = true)
+            }
         }
     }
 

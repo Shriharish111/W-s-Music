@@ -49,7 +49,12 @@ class MixEngine(private val source: CandidateSource, private val songMeta: Map<S
                 edges.getOrPut(other) { HashMap() }.merge(artist, 1.0, Double::plus)
             }
         }
-        val clusters = clusterArtists(artists, edges, profile)
+        // A small library (a few likes, little listening) is too thin to split into taste groups:
+        // blend it into one mix instead, and accept a smaller familiar core.
+        val knownCount = artists.sumOf { a -> profile.tracksOf(a).count { it.songId in songMeta } }
+        val small = knownCount < SMALL_LIBRARY
+        val clusters = if (small) listOf(artists) else clusterArtists(artists, edges, profile)
+        val minFamiliar = if (small) MIN_FAMILIAR_SMALL_LIBRARY else MIN_FAMILIAR_PER_MIX
 
         val used = HashSet<String>()
         return clusters.mapNotNull { cluster ->
@@ -58,7 +63,7 @@ class MixEngine(private val source: CandidateSource, private val songMeta: Map<S
                 .sortedByDescending { profile.tracks[it.id]?.longScore ?: 0.0 }
                 .filter { it.id !in used }
             // A mix needs a real taste behind it, not an artist heard once in passing.
-            if (familiar.size < MIN_FAMILIAR_PER_MIX) return@mapNotNull null
+            if (familiar.size < minFamiliar) return@mapNotNull null
             // New songs: from the cluster's radios, by artists in (or next to) the cluster, never played.
             val counts = HashMap<String, Int>()
             val byId = HashMap<String, SongItem>()
@@ -171,6 +176,10 @@ class MixEngine(private val source: CandidateSource, private val songMeta: Map<S
     companion object {
         /** Known songs a taste cluster needs before it becomes a Daily Mix. */
         const val MIN_FAMILIAR_PER_MIX = 3
+
+        /** Below this many known songs the whole library is treated as one taste (a single Daily Mix). */
+        const val SMALL_LIBRARY = 6
+        const val MIN_FAMILIAR_SMALL_LIBRARY = 2
 
         /** Familiar and new songs mixed: [familiarEvery] familiar ones, then one new one, and so on. */
         fun interleave(familiar: List<SongItem>, fresh: List<SongItem>, familiarEvery: Int): List<SongItem> = buildList {

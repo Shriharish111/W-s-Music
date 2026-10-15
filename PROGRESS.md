@@ -27,6 +27,13 @@ Plan: `D:\WMUSIC\PLAN.md`; client research notes: `D:\WMUSIC\_research\SPOTIFY_N
   show a sparkle with Remove (hides it for that page) and, in your own playlists, Add to playlist.
   Song menu: Not interested, Hide from this playlist/mix/album, Don't play <artist>, Exclude from your taste profile
   (each reversible; toast Undo). Hidden / blocked songs are dimmed and skipped by `startCurrent`.
+- **Cold start / small libraries (done):** fewer than 6 known songs -> the library is one taste, a single Daily Mix
+  needing 2 familiar songs (`MixEngine.dailyMixes`); Smart Shuffle uses `min(3, upcoming)` as its step so short lists get
+  a recommendation (an empty fetch is no longer cached for the day); an empty mix build is retried the same day after
+  5 plays or a changed like count (`Recommender.isStale`; `Controller.onSignalRecorded` triggers at 5 while Daily/Discover
+  are missing, else 20); history rows (Android import, pre-signal plays) are turned into `import` signals by
+  `LibraryDao.backfillSignalsFromHistory` at the start of every mix build; an import also forces a rebuild.
+  Taste only looks back 365 days, so very old imported plays don't count.
   Test hygiene: tests must cancel+join their Controller scope (`TestScope.stop()`) before closing the DB, else the
   native SQLite crashes the test JVM; `Main.kt` does the same on window close.
 

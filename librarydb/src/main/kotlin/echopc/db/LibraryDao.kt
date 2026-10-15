@@ -166,6 +166,25 @@ abstract class LibraryDao {
     @Query("SELECT * FROM listen_signal WHERE timestamp >= :since ORDER BY timestamp, id")
     abstract suspend fun signalsSince(since: LocalDateTime): List<ListenSignal>
 
+    /**
+     * Turns history rows (`event`: imported from the Android app, or logged by older versions) into taste
+     * signals. A row already represented by a live signal for the same song within a minute is skipped, so
+     * this is safe to run repeatedly. Plays have no skip information here, so they are "import" plays.
+     */
+    @Query(
+        """
+        INSERT INTO listen_signal (songId, artistKey, artistName, timestamp, playedMs, durationMs, startReason, endReason, context)
+        SELECT e.songId,
+          COALESCE((SELECT CASE WHEN a.id = '' OR substr(a.id, 1, 2) = 'LA' THEN 'name:' || lower(trim(a.name)) ELSE a.id END
+                    FROM song_artist_map m JOIN artist a ON a.id = m.artistId WHERE m.songId = e.songId ORDER BY m.position LIMIT 1), 'name:unknown'),
+          COALESCE((SELECT a.name FROM song_artist_map m JOIN artist a ON a.id = m.artistId WHERE m.songId = e.songId ORDER BY m.position LIMIT 1), ''),
+          e.timestamp, e.playTime, CASE WHEN s.duration > 0 THEN s.duration * 1000 ELSE 0 END, 'import', 'import', 'history'
+        FROM event e JOIN song s ON s.id = e.songId
+        WHERE NOT EXISTS (SELECT 1 FROM listen_signal l WHERE l.songId = e.songId AND l.timestamp BETWEEN e.timestamp - 60000 AND e.timestamp + 60000)
+        """,
+    )
+    abstract suspend fun backfillSignalsFromHistory()
+
     @Query("SELECT COUNT(*) FROM listen_signal WHERE timestamp > :since")
     abstract suspend fun countSignalsAfter(since: LocalDateTime): Int
 

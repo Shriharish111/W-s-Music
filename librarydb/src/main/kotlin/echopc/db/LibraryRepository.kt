@@ -161,6 +161,9 @@ class LibraryRepository(private val db: LibraryDatabase) {
         )
     }
 
+    /** Adds a taste signal for every history entry that has none yet (imported or pre-signal plays). */
+    suspend fun backfillSignalsFromHistory() = dao.backfillSignalsFromHistory()
+
     suspend fun signalsSince(since: LocalDateTime): List<ListenSignal> = dao.signalsSince(since)
     suspend fun countSignalsAfter(since: LocalDateTime): Int = dao.countSignalsAfter(since)
 

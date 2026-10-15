@@ -29,8 +29,19 @@ class Recommender(
     private val clock: () -> LocalDateTime = LocalDateTime::now,
 ) {
     private val mutex = Mutex()
-    /** Kinds that produced nothing today (too little history yet): don't retry until tomorrow. */
-    private val emptyAttempts = HashMap<String, LocalDateTime>()
+    /** A build that produced nothing (too little history yet), and what the library looked like then. */
+    private class Attempt(val at: LocalDateTime, val likedCount: Int)
+
+    /** Kinds that came up empty: retried when listening or likes change, else tomorrow. */
+    private val emptyAttempts = HashMap<String, Attempt>()
+
+    /** Forget empty results (after an import or other big change), so everything is tried again. */
+    fun invalidateEmpty() = emptyAttempts.clear()
+
+    companion object {
+        /** New plays since an empty build before it is tried again the same day. */
+        const val RETRY_AFTER_SIGNALS = 5
+    }
 
     val kinds = listOf(MixKind.DISCOVER, MixKind.RADAR, MixKind.DAILY, MixKind.ON_REPEAT, MixKind.REWIND)
 
@@ -53,7 +64,7 @@ class Recommender(
                 MixKind.REWIND -> listOfNotNull(engine.repeatRewind(profile, now.millis()))
                 else -> emptyList()
             }
-            if (drafts.isEmpty()) emptyAttempts[kind] = now else emptyAttempts.remove(kind)
+            if (drafts.isEmpty()) emptyAttempts[kind] = Attempt(now, inputs.likedCount) else emptyAttempts.remove(kind)
             library.replaceMixes(kind, drafts.mapIndexed { i, d -> d.toEntity(positionOf(kind, i), now) })
         }
         library.pruneRelated(olderThanDays = 30)
@@ -61,7 +72,12 @@ class Recommender(
     }
 
     internal suspend fun isStale(kind: String, mixes: List<GeneratedMix>, now: LocalDateTime): Boolean {
-        if (mixes.isEmpty()) return emptyAttempts[kind]?.toLocalDate() != now.toLocalDate()
+        if (mixes.isEmpty()) {
+            val attempt = emptyAttempts[kind] ?: return true
+            if (attempt.at.toLocalDate() != now.toLocalDate()) return true
+            // Same day: try again as soon as there is new listening or a like to learn from.
+            return library.countSignalsAfter(attempt.at) >= RETRY_AFTER_SIGNALS || library.likedSongs.first().size != attempt.likedCount
+        }
         val at = mixes.minOf { it.generatedAt }
         return when (kind) {
             MixKind.DISCOVER -> at < now.toLocalDate().with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY)).atStartOfDay()
@@ -114,15 +130,17 @@ class Recommender(
             }
         }
         val ranked = MixEngine.capPerArtist(score.entries.sortedByDescending { it.value }.map { byId.getValue(it.key) }, 2).take(maxOf(count, 30))
-        library.cacheRelated(key, ranked)
+        if (ranked.isNotEmpty()) library.cacheRelated(key, ranked) // a failed fetch must not stick for the day
         return ranked.take(count)
     }
 
     // ---------------- inputs ----------------
 
-    class Inputs(val plays: List<Play>, val profile: TasteProfile, val meta: Map<String, SongItem>, val recentSeeds: List<SongItem>)
+    class Inputs(val plays: List<Play>, val profile: TasteProfile, val meta: Map<String, SongItem>, val recentSeeds: List<SongItem>, val likedCount: Int)
 
     suspend fun loadInputs(now: LocalDateTime): Inputs {
+        // Plays from before the signal log (history imported from the Android app, or older app versions) count too.
+        library.backfillSignalsFromHistory()
         val signals = library.signalsSince(now.minusDays(365))
         val plays = signals.map { Play(it.songId, it.artistKey, it.artistName, it.timestamp.millis(), it.playedMs, it.durationMs, it.endReason) }
         val likedRows = library.likedSongs.first()
@@ -140,6 +158,6 @@ class Recommender(
         val recent = profile.tracks.values.filter { it.lastPlayed >= since && it.shortScore > 0 && it.songId !in profile.excluded }
             .sortedByDescending { it.shortScore }.mapNotNull { meta[it.songId] }
         val seeds = (recent + liked.mapNotNull { meta[it.songId] }).distinctBy { it.id }.take(15)
-        return Inputs(plays, profile, meta, seeds)
+        return Inputs(plays, profile, meta, seeds, liked.size)
     }
 }

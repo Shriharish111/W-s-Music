@@ -89,9 +89,11 @@ data class QueueState(
         val fresh = recs.filter { r -> base.items.none { it.id == r.id } }.distinctBy { it.id }
         val merged = ArrayList<SongItem>()
         var r = 0
+        // A short list still gets a recommendation: never wait for more songs than there are.
+        val step = every.coerceIn(1, maxOf(1, upcoming.size))
         upcoming.forEachIndexed { i, song ->
             merged += song
-            if ((i + 1) % every == 0 && r < fresh.size) merged += fresh[r++]
+            if ((i + 1) % step == 0 && r < fresh.size) merged += fresh[r++]
         }
         if (upcoming.isEmpty() && r < fresh.size) merged += fresh[r++] // a one-song list still gets something
         val used = fresh.take(r).map { it.id }.toSet()
