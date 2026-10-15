@@ -1,6 +1,9 @@
 package echopc
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.TooltipArea
+import androidx.compose.foundation.TooltipPlacement
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -25,15 +28,18 @@ import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
@@ -43,11 +49,18 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.isSecondaryPressed
+import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 
 // Performance note: this UI deliberately has no continuous animations, spring/scale effects or
@@ -69,6 +82,42 @@ fun Modifier.focusRing(shape: androidx.compose.ui.graphics.Shape = RoundedCorner
     return this.onFocusChanged { focused = it.isFocused }.then(if (focused) Modifier.border(2.dp, Ws.text, shape) else Modifier)
 }
 
+// ---------- tooltips ----------
+
+/** Tooltips open above their button instead of below it (for controls at the bottom of the window). */
+val LocalTooltipAbove = compositionLocalOf { false }
+
+/**
+ * Hover label for a control: its name, and its keyboard shortcut if it has one. The same text is the
+ * control's accessible name, so what a screen reader says and what the tooltip shows are the same words.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun WsTooltip(text: String, shortcut: String?, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    if (text.isBlank()) { Box(modifier) { content() }; return }
+    val above = LocalTooltipAbove.current
+    val shape = RoundedCornerShape(4.dp)
+    TooltipArea(
+        tooltip = {
+            Row(
+                Modifier.clip(shape).background(Ws.surfaceTop).border(1.dp, Ws.border, shape).padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(text, style = MaterialTheme.typography.bodySmall, color = Ws.text, maxLines = 1)
+                if (shortcut != null) Text(shortcut, style = MaterialTheme.typography.labelSmall, color = Ws.muted, maxLines = 1)
+            }
+        },
+        modifier = modifier,
+        delayMillis = 400,
+        tooltipPlacement = TooltipPlacement.ComponentRect(
+            anchor = if (above) Alignment.TopCenter else Alignment.BottomCenter,
+            alignment = if (above) Alignment.TopCenter else Alignment.BottomCenter,
+            offset = DpOffset(0.dp, if (above) (-4).dp else 4.dp),
+        ),
+        content = content,
+    )
+}
+
 // ---------- buttons ----------
 
 @Composable
@@ -83,21 +132,24 @@ fun WsIconButton(
     hoverTint: Color = Ws.text,
     enabled: Boolean = true,
     background: Color = Color.Transparent,
+    shortcut: String? = null,
 ) {
     val source = remember { MutableInteractionSource() }
     val hovered by source.collectIsHoveredAsState()
     val color = if (!enabled) Ws.faint.copy(alpha = 0.6f) else if (hovered) hoverTint else tint
-    Box(
-        modifier
-            .size(size)
-            .focusRing(CircleShape)
-            .clip(CircleShape)
-            .background(background)
-            .hoverable(source)
-            .clickable(source, null, enabled = enabled, onClick = onClick)
-            .handCursor(),
-        contentAlignment = Alignment.Center,
-    ) { Icon(icon, description, Modifier.size(iconSize), tint = color) }
+    WsTooltip(description, shortcut, modifier) {
+        Box(
+            Modifier
+                .size(size)
+                .focusRing(CircleShape)
+                .clip(CircleShape)
+                .background(background)
+                .hoverable(source)
+                .clickable(source, null, enabled = enabled, role = Role.Button, onClick = onClick)
+                .handCursor(),
+            contentAlignment = Alignment.Center,
+        ) { Icon(icon, description, Modifier.size(iconSize), tint = color) }
+    }
 }
 
 /** Filled pill in the accent colour: the one primary action on a page. */
@@ -163,6 +215,7 @@ fun PlayButton(
     modifier: Modifier = Modifier,
     size: Dp = 36.dp,
     onAccent: Boolean = false,
+    shortcut: String? = null,
 ) {
     val accent = LocalAccent.current
     val source = remember { MutableInteractionSource() }
@@ -172,20 +225,23 @@ fun PlayButton(
         else -> if (hovered) Color(0xFFE6E6E6) else Color.White
     }
     val ink = if (onAccent) accent.onPrimary else Color.Black
-    Box(
-        modifier
-            .size(size)
-            .graphicsLayer { alpha = if (enabled) 1f else 0.5f }
-            .focusRing(CircleShape)
-            .clip(CircleShape)
-            .background(bg)
-            .hoverable(source)
-            .clickable(source, null, enabled = enabled, onClick = onClick)
-            .handCursor(),
-        contentAlignment = Alignment.Center,
-    ) {
-        val glyph = when { loading -> Icons.Rounded.MoreHoriz; playing -> Icons.Rounded.Pause; else -> Icons.Rounded.PlayArrow }
-        Icon(glyph, if (playing) "Pause" else "Play", Modifier.size(size * 0.58f), tint = ink)
+    val label = when { loading -> "Loading"; playing -> "Pause"; else -> "Play" }
+    WsTooltip(label, shortcut, modifier) {
+        Box(
+            Modifier
+                .size(size)
+                .graphicsLayer { alpha = if (enabled) 1f else 0.5f }
+                .focusRing(CircleShape)
+                .clip(CircleShape)
+                .background(bg)
+                .hoverable(source)
+                .clickable(source, null, enabled = enabled, role = Role.Button, onClick = onClick)
+                .handCursor(),
+            contentAlignment = Alignment.Center,
+        ) {
+            val glyph = when { loading -> Icons.Rounded.MoreHoriz; playing -> Icons.Rounded.Pause; else -> Icons.Rounded.PlayArrow }
+            Icon(glyph, label, Modifier.size(size * 0.58f), tint = ink)
+        }
     }
 }
 
@@ -194,11 +250,11 @@ fun PlayButton(
  * [description] says what a click will do.
  */
 @Composable
-fun ShuffleButton(mode: ShuffleMode, description: String, onClick: () -> Unit, modifier: Modifier = Modifier, size: Dp = 32.dp, iconSize: Dp = 18.dp, enabled: Boolean = true) {
+fun ShuffleButton(mode: ShuffleMode, description: String, onClick: () -> Unit, modifier: Modifier = Modifier, size: Dp = 32.dp, iconSize: Dp = 18.dp, enabled: Boolean = true, shortcut: String? = null) {
     val accent = LocalAccent.current
     Box(modifier.size(size)) {
         WsIconButton(
-            Icons.Rounded.Shuffle, description, onClick, size = size, iconSize = iconSize, enabled = enabled,
+            Icons.Rounded.Shuffle, description, onClick, size = size, iconSize = iconSize, enabled = enabled, shortcut = shortcut,
             tint = if (mode == ShuffleMode.OFF) Ws.muted else accent.highlight, hoverTint = if (mode == ShuffleMode.OFF) Ws.text else accent.primary,
         )
         if (mode == ShuffleMode.SMART) Icon(
@@ -306,19 +362,45 @@ fun MetaText(text: String, modifier: Modifier = Modifier) {
     Text(text, modifier, style = MaterialTheme.typography.bodySmall, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
 }
 
-/** Full-width list row with hover highlight; [content] lays out its own children. */
+/**
+ * Full-width list row with hover highlight; [content] lays out its own children.
+ * With [menu], a right-click anywhere on the row opens it at the pointer (the same options as the row's "..." button).
+ */
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun HoverRow(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     selected: Boolean = false,
+    menu: (@Composable (close: () -> Unit) -> Unit)? = null,
     content: @Composable (hovered: Boolean) -> Unit,
 ) {
     val source = remember { MutableInteractionSource() }
     val hovered by source.collectIsHoveredAsState()
     val bg = when { selected -> Color.White.copy(alpha = 0.12f); hovered -> Color.White.copy(alpha = 0.07f); else -> Color.Transparent }
+    var menuOpen by remember { mutableStateOf(false) }
+    var menuAt by remember { mutableStateOf(DpOffset.Zero) }
+    var rowHeight by remember { mutableStateOf(0.dp) }
+    val density = LocalDensity.current
     Box(
         modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(bg)
-            .hoverable(source).clickable(source, null, onClick = onClick).handCursor(),
-    ) { content(hovered) }
+            .hoverable(source).clickable(source, null, onClick = onClick).handCursor()
+            .onSizeChanged { rowHeight = with(density) { it.height.toDp() } }
+            .then(
+                if (menu == null) Modifier
+                else Modifier.onPointerEvent(PointerEventType.Press) { e ->
+                    if (e.buttons.isSecondaryPressed) {
+                        val p = e.changes.first().position
+                        // A dropdown sits below its anchor (this row) plus the offset: aim for the pointer.
+                        menuAt = with(density) { DpOffset(p.x.toDp(), p.y.toDp() - rowHeight) }
+                        menuOpen = true
+                    }
+                },
+            ),
+    ) {
+        content(hovered)
+        if (menu != null) DropdownMenu(menuOpen, { menuOpen = false }, offset = menuAt, containerColor = Ws.surfaceTop, shape = RoundedCornerShape(4.dp)) {
+            menu { menuOpen = false }
+        }
+    }
 }

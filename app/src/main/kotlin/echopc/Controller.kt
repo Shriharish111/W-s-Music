@@ -204,6 +204,12 @@ class Controller(
     private var shelfOrder: List<String> = emptyList()
     private val shelfImpressions = HashSet<String>()
 
+    // ---- keyboard shortcuts ----
+    var shortcutsOpen by mutableStateOf(false)
+    /** Bumped by Ctrl+L; the search box focuses itself when it changes. */
+    var searchFocusTick by mutableStateOf(0)
+    private var volumeBeforeMute = 0.8f
+
     // ---- feedback & shuffle ----
     var blocks by mutableStateOf(Blocks())
     /** Shuffle mode per play context (only non-OFF entries are kept). */
@@ -340,6 +346,49 @@ class Controller(
     }
 
     fun togglePause() = engine.togglePause()
+
+    fun toggleMute() {
+        if (volume == 0f) changeVolume(volumeBeforeMute.coerceAtLeast(0.05f))
+        else { volumeBeforeMute = volume; changeVolume(0f) }
+    }
+
+    /** Runs a keyboard shortcut (see [Shortcut]); the same actions as the buttons. */
+    fun perform(shortcut: Shortcut) {
+        when (shortcut) {
+            Shortcut.PLAY_PAUSE -> togglePause()
+            Shortcut.NEXT -> skipNext()
+            Shortcut.PREVIOUS -> skipPrevious()
+            Shortcut.SEEK_FORWARD -> seekBy(5_000)
+            Shortcut.SEEK_BACK -> seekBy(-5_000)
+            Shortcut.VOLUME_UP -> nudgeVolume(+0.1f)
+            Shortcut.VOLUME_DOWN -> nudgeVolume(-0.1f)
+            Shortcut.MUTE -> toggleMute()
+            Shortcut.SHUFFLE -> {
+                cycleShuffle()
+                showToast(when (shuffleMode()) { ShuffleMode.OFF -> "Shuffle off"; ShuffleMode.ON -> "Shuffle on"; ShuffleMode.SMART -> "Smart Shuffle on" })
+            }
+            Shortcut.REPEAT -> {
+                cycleRepeat()
+                showToast(when (queue.repeat) { RepeatMode.OFF -> "Repeat off"; RepeatMode.ALL -> "Repeat all"; RepeatMode.ONE -> "Repeat this song" })
+            }
+            Shortcut.LIKE -> queue.current?.let { toggleLike(it) }
+            Shortcut.SEARCH -> { navigate(Route.Search); searchFocusTick++ }
+            Shortcut.BACK -> goBack()
+            Shortcut.FORWARD -> goForward()
+            Shortcut.HELP -> shortcutsOpen = !shortcutsOpen
+        }
+    }
+
+    private fun seekBy(deltaMs: Long) {
+        val duration = playback.durationMs
+        if (queue.current == null || duration <= 0) return
+        seek((positionMs + deltaMs).coerceIn(0L, duration))
+    }
+
+    private fun nudgeVolume(delta: Float) {
+        changeVolume((volume + delta).coerceIn(0f, 1f))
+        showToast("Volume ${(volume * 100).toInt()}%")
+    }
     fun seek(ms: Long) { positionMs = ms; engine.seek(ms) }
     fun changeVolume(v: Float) { volume = v; engine.setVolume(v.toDouble()) }
 

@@ -229,7 +229,7 @@ private fun QueueSectionTitle(text: String, modifier: Modifier = Modifier) {
 private fun QueueRow(c: Controller, song: SongItem, index: Int, current: Boolean) {
     val accent = LocalAccent.current
     val recommended = c.queue.isRecommended(index)
-    HoverRow({ c.jumpTo(index) }) { hovered ->
+    HoverRow({ c.jumpTo(index) }, menu = { close -> SongMenuItems(c, song, c.queueContext, close, queueIndex = index) }) { hovered ->
         Row(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Thumb(song.thumbnail, 44.dp, corner = 4.dp, seed = song.title)
             Column(Modifier.weight(1f)) {

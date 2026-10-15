@@ -34,6 +34,12 @@ Plan: `D:\WMUSIC\PLAN.md`; client research notes: `D:\WMUSIC\_research\SPOTIFY_N
   are missing, else 20); history rows (Android import, pre-signal plays) are turned into `import` signals by
   `LibraryDao.backfillSignalsFromHistory` at the start of every mix build; an import also forces a rebuild.
   Taste only looks back 365 days, so very old imported plays don't count.
+- **Keyboard, tooltips, right-click (done):** `Shortcuts.kt` is the single table of shortcuts (Space, Ctrl+Left/Right,
+  Shift+Left/Right seek, Ctrl+Up/Down volume, M, Ctrl+S, Ctrl+R, Alt+Shift+B like, Ctrl+L, Alt+Left/Right, Ctrl+/ help);
+  `ShortcutHandler` is wired in `Main.kt` and stands down while a text box has focus. `WsTooltip` (Widgets.kt) gives every
+  icon button a hover label with its shortcut (above the button in the player bar, below elsewhere) and `Role.Button`;
+  `HoverRow(menu = ...)` opens `SongMenuItems` at the pointer on right-click (song rows and queue rows).
+  No auto-update: the app is a manually distributed Compose Desktop build (only the YouTube cipher config is fetched live).
   Test hygiene: tests must cancel+join their Controller scope (`TestScope.stop()`) before closing the DB, else the
   native SQLite crashes the test JVM; `Main.kt` does the same on window close.
 

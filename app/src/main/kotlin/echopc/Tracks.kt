@@ -29,6 +29,7 @@ import androidx.compose.material.icons.rounded.PlaylistAdd
 import androidx.compose.material.icons.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Block
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ThumbDown
 import androidx.compose.material.icons.rounded.ThumbUp
@@ -207,7 +208,10 @@ fun TrackRow(
     val liked = song.id in c.likedIds
     // Hidden here, not wanted, or by a blocked artist: shown dimmed and skipped when playing.
     val blocked = c.blocks.blocked(song, routeContext(c.route))
-    HoverRow({ c.playFromList(songs, index) }, selected = false) { hovered ->
+    HoverRow(
+        { c.playFromList(songs, index) }, selected = false,
+        menu = { close -> SongMenuItems(c, song, routeContext(c.route), close) }, // right-click anywhere on the row
+    ) { hovered ->
         Row(Modifier.height(56.dp).padding(horizontal = 16.dp).alpha(if (blocked) 0.4f else 1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             Box(Modifier.width(24.dp), contentAlignment = Alignment.CenterEnd) {
                 when {
@@ -242,36 +246,46 @@ fun TrackRow(
     }
 }
 
-/** "…" menu for a song: queue actions and add-to-playlist. Invisible (but focusable) until the row is hovered. */
+/** "…" button for a song: opens [SongMenuItems]. Invisible (but focusable) until the row is hovered. */
 @Composable
 fun SongMenu(c: Controller, song: SongItem, visible: Boolean = true) {
     var open by remember { mutableStateOf(false) }
-    var inPlaylists by remember { mutableStateOf(false) }
-    val playlists by c.library.playlists.collectAsState(emptyList())
     Box {
         WsIconButton(
-            Icons.Rounded.MoreHoriz, "More options for ${song.title}", { open = true; inPlaylists = false }, size = 32.dp, iconSize = 20.dp,
+            Icons.Rounded.MoreHoriz, "More options for ${song.title}", { open = true }, size = 32.dp, iconSize = 20.dp,
             tint = if (visible || open) Ws.muted else Color.Transparent,
         )
         DropdownMenu(open, { open = false }, containerColor = Ws.surfaceTop, shape = RoundedCornerShape(4.dp)) {
-            if (!inPlaylists) {
-                MenuItem("Play next", Icons.Rounded.PlayArrow) { c.playNext(song); open = false }
-                MenuItem("Add to queue", Icons.Rounded.QueueMusic) { c.addToQueue(song); open = false }
-                MenuItem("Add to playlist", Icons.Rounded.PlaylistAdd) { inPlaylists = true }
-                HorizontalDivider(Modifier.padding(vertical = 4.dp), color = Ws.border)
-                FeedbackItems(c, song) { open = false }
-            } else {
-                MenuItem("New playlist", Icons.Rounded.Add) { c.newPlaylistFor = song; c.newPlaylistOpen = true; open = false }
-                playlists.forEach { p -> MenuItem(p.playlist.name, Icons.Rounded.MusicNote) { c.addToPlaylist(p.playlist.id, song); open = false } }
-            }
+            SongMenuItems(c, song, routeContext(c.route), close = { open = false })
         }
+    }
+}
+
+/**
+ * The options for one song, shared by the "…" button and the right-click menu on rows.
+ * [context] is the page or queue the song is in (for "hide from this playlist"); [queueIndex] adds
+ * "Remove from queue" when the song is a row of the queue.
+ */
+@Composable
+fun SongMenuItems(c: Controller, song: SongItem, context: String, close: () -> Unit, queueIndex: Int? = null) {
+    var inPlaylists by remember { mutableStateOf(false) }
+    val playlists by c.library.playlists.collectAsState(emptyList())
+    if (!inPlaylists) {
+        MenuItem("Play next", Icons.Rounded.PlayArrow) { c.playNext(song); close() }
+        MenuItem("Add to queue", Icons.Rounded.QueueMusic) { c.addToQueue(song); close() }
+        MenuItem("Add to playlist", Icons.Rounded.PlaylistAdd) { inPlaylists = true }
+        if (queueIndex != null && queueIndex != c.queue.index) MenuItem("Remove from queue", Icons.Rounded.Close) { c.removeFromQueue(queueIndex); close() }
+        HorizontalDivider(Modifier.padding(vertical = 4.dp), color = Ws.border)
+        FeedbackItems(c, song, context, close)
+    } else {
+        MenuItem("New playlist", Icons.Rounded.Add) { c.newPlaylistFor = song; c.newPlaylistOpen = true; close() }
+        playlists.forEach { p -> MenuItem(p.playlist.name, Icons.Rounded.MusicNote) { c.addToPlaylist(p.playlist.id, song); close() } }
     }
 }
 
 /** "Tell the recommender" items: each one has an inverse when it's already set. */
 @Composable
-private fun FeedbackItems(c: Controller, song: SongItem, close: () -> Unit) {
-    val context = routeContext(c.route)
+private fun FeedbackItems(c: Controller, song: SongItem, context: String, close: () -> Unit) {
     val b = c.blocks
     if (song.id in b.notInterested) MenuItem("Recommend this again", Icons.Rounded.ThumbUp) { c.recommendAgain(song); close() }
     else MenuItem("Not interested", Icons.Rounded.ThumbDown) { c.notInterested(song); close() }

@@ -32,6 +32,7 @@ import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Keyboard
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -39,6 +40,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,6 +48,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -97,6 +101,7 @@ fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
                 }
             }
         }
+        if (c.shortcutsOpen) ShortcutsDialog { c.shortcutsOpen = false }
         if (c.newPlaylistOpen) NameDialog("New playlist", "", "Create", onConfirm = c::createPlaylist, onDismiss = { c.newPlaylistOpen = false; c.newPlaylistFor = null })
         ImportDialog(c)
     }
@@ -169,7 +174,8 @@ private fun TopBar(c: Controller, onPickAndroidFile: () -> Unit) {
             WsIconButton(if (home) Icons.Rounded.Home else Icons.Outlined.Home, "Home", { c.goHome() }, size = 48.dp, iconSize = 24.dp, tint = if (home) Ws.text else Ws.muted, background = Ws.surfaceHi)
             TopSearch(c)
         }
-        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
+        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End)) {
+            WsIconButton(Icons.Rounded.Keyboard, "Keyboard shortcuts", { c.shortcutsOpen = true }, size = 32.dp, iconSize = 20.dp, shortcut = Shortcut.HELP.keys)
             WsIconButton(Icons.Rounded.FileUpload, "Import from the Android app", onPickAndroidFile, size = 32.dp, iconSize = 18.dp)
         }
     }
@@ -189,6 +195,9 @@ private fun TopSearch(c: Controller) {
     val source = remember { MutableInteractionSource() }
     val hovered by source.collectIsHoveredAsState()
     val shape = RoundedCornerShape(50)
+    val focusRequester = remember { FocusRequester() }
+    // Ctrl+L: jump to the search box.
+    LaunchedEffect(c.searchFocusTick) { if (c.searchFocusTick > 0) runCatching { focusRequester.requestFocus() } }
     Row(
         Modifier.widthIn(min = 280.dp, max = 480.dp).width(420.dp).height(48.dp).clip(shape).background(if (hovered || focused) Ws.surfaceTop else Ws.surfaceHi)
             .border(if (focused) 2.dp else 0.dp, if (focused) Ws.text else Color.Transparent, shape)
@@ -204,7 +213,7 @@ private fun TopSearch(c: Controller) {
                 cursorBrush = SolidColor(Ws.text),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { c.search() }),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().focusRequester(focusRequester)
                     .onFocusChanged { focused = it.isFocused; c.typing = it.isFocused; if (it.isFocused) c.navigate(Route.Search) }
                     .onKeyEvent { if (it.type == KeyEventType.KeyDown && it.key == Key.Enter) { c.search(); true } else false },
             )
@@ -216,6 +225,35 @@ private fun TopSearch(c: Controller) {
 // =====================================================================================
 //  Dialogs
 // =====================================================================================
+
+/** All keyboard shortcuts, grouped, from the same table the key handling uses. */
+@Composable
+fun ShortcutsDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss, containerColor = Ws.surfaceHi, shape = RoundedCornerShape(8.dp),
+        title = { Text("Keyboard shortcuts", style = MaterialTheme.typography.headlineMedium, color = Ws.text) },
+        text = {
+            Column(Modifier.widthIn(min = 420.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Shortcut.entries.groupBy { it.group }.forEach { (group, items) ->
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(group, style = MaterialTheme.typography.titleSmall, color = Ws.text)
+                        items.forEach { s ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(s.label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = Ws.muted)
+                                Text(
+                                    s.keys, Modifier.clip(RoundedCornerShape(4.dp)).background(Ws.surfaceTop).padding(horizontal = 8.dp, vertical = 3.dp),
+                                    style = MaterialTheme.typography.labelMedium, color = Ws.text,
+                                )
+                            }
+                        }
+                    }
+                }
+                Text("Right-click any song to see its options. Shortcuts stand down while you type in a text box.", style = MaterialTheme.typography.bodySmall, color = Ws.muted)
+            }
+        },
+        confirmButton = { PrimaryButton("Close", onDismiss) },
+    )
+}
 
 @Composable
 fun NameDialog(title: String, initial: String, confirmLabel: String, onConfirm: (String) -> Unit, onDismiss: () -> Unit) {

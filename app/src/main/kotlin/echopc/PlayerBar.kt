@@ -27,6 +27,7 @@ import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -39,7 +40,8 @@ fun PlayerBar(c: Controller) {
     val accent = LocalAccent.current
     val song = c.queue.current
     val has = song != null
-    Row(
+    // The bar is at the bottom of the window: its tooltips open upward.
+    CompositionLocalProvider(LocalTooltipAbove provides true) { Row(
         Modifier.fillMaxWidth().height(80.dp).padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -64,6 +66,7 @@ fun PlayerBar(c: Controller) {
                 WsIconButton(
                     if (liked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder, if (liked) "Remove from Liked Songs" else "Save to Liked Songs", { c.toggleLike(song) },
                     size = 32.dp, iconSize = 18.dp, tint = if (liked) accent.highlight else Ws.muted, hoverTint = if (liked) accent.primary else Ws.text,
+                    shortcut = Shortcut.LIKE.keys,
                 )
             }
         }
@@ -72,15 +75,17 @@ fun PlayerBar(c: Controller) {
         Column(Modifier.weight(0.4f).widthIn(max = 720.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 val mode = c.shuffleMode()
-                ShuffleButton(mode, shuffleActionLabel(mode, c.smartAvailable(c.queueContext)), { c.cycleShuffle() }, enabled = c.queue.items.size > 1)
-                WsIconButton(Icons.Rounded.SkipPrevious, "Previous", { c.skipPrevious() }, enabled = has, size = 32.dp, iconSize = 24.dp)
-                PlayButton(c.playback.playing, c.playback.loading, has && c.playback.durationMs > 0 || c.playback.loading, { c.togglePause() }, size = 32.dp)
-                WsIconButton(Icons.Rounded.SkipNext, "Next", { c.skipNext() }, enabled = has, size = 32.dp, iconSize = 24.dp)
+                ShuffleButton(mode, shuffleActionLabel(mode, c.smartAvailable(c.queueContext)), { c.cycleShuffle() }, enabled = c.queue.items.size > 1, shortcut = Shortcut.SHUFFLE.keys)
+                WsIconButton(Icons.Rounded.SkipPrevious, "Previous", { c.skipPrevious() }, enabled = has, size = 32.dp, iconSize = 24.dp, shortcut = Shortcut.PREVIOUS.keys)
+                PlayButton(c.playback.playing, c.playback.loading, has && c.playback.durationMs > 0 || c.playback.loading, { c.togglePause() }, size = 32.dp, shortcut = Shortcut.PLAY_PAUSE.keys)
+                WsIconButton(Icons.Rounded.SkipNext, "Next", { c.skipNext() }, enabled = has, size = 32.dp, iconSize = 24.dp, shortcut = Shortcut.NEXT.keys)
                 WsIconButton(
                     if (c.queue.repeat == RepeatMode.ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
-                    when (c.queue.repeat) { RepeatMode.OFF -> "Repeat: off"; RepeatMode.ALL -> "Repeat: all"; RepeatMode.ONE -> "Repeat: one" },
+                    // What a click does next, like the shuffle button.
+                    when (c.queue.repeat) { RepeatMode.OFF -> "Turn on repeat"; RepeatMode.ALL -> "Repeat this song"; RepeatMode.ONE -> "Turn off repeat" },
                     { c.cycleRepeat() }, size = 32.dp, iconSize = 18.dp,
                     tint = if (c.queue.repeat == RepeatMode.OFF) Ws.muted else accent.highlight,
+                    shortcut = Shortcut.REPEAT.keys,
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -103,10 +108,10 @@ fun PlayerBar(c: Controller) {
             WsIconButton(Icons.Rounded.Lyrics, "Lyrics", { c.toggleLyrics() }, size = 32.dp, iconSize = 18.dp, tint = tintFor(c.route == Route.Lyrics), enabled = has)
             WsIconButton(Icons.Rounded.QueueMusic, "Queue", { c.togglePanel(PanelTab.QUEUE) }, size = 32.dp, iconSize = 18.dp, tint = tintFor(c.panelOpen && c.panelTab == PanelTab.QUEUE))
             val volIcon = when { c.volume == 0f -> Icons.Rounded.VolumeOff; c.volume < 0.5f -> Icons.Rounded.VolumeDown; else -> Icons.Rounded.VolumeUp }
-            WsIconButton(volIcon, if (c.volume == 0f) "Unmute" else "Mute", { c.changeVolume(if (c.volume == 0f) 0.8f else 0f) }, size = 32.dp, iconSize = 18.dp)
+            WsIconButton(volIcon, if (c.volume == 0f) "Unmute" else "Mute", { c.toggleMute() }, size = 32.dp, iconSize = 18.dp, shortcut = Shortcut.MUTE.keys)
             SeekBar({ c.volume }, { c.changeVolume(it) }, Modifier.width(96.dp))
         }
-    }
+    } }
 }
 
 /** Own composable so only this label (not the whole player bar) recomposes as time advances. */

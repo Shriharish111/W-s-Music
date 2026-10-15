@@ -96,10 +96,12 @@ class ScreenshotTest {
 
         setContent { WsTheme(c.accent) { AppContent(c, onPickAndroidFile = {}) } }
 
-        fun shot(name: String) {
+        fun shot(name: String, dialog: Boolean = false) {
             Thread.sleep(1500) // let thumbnails finish loading
             waitForIdle()
-            val bmp = onRoot().captureToImage().asSkiaBitmap()
+            // An open dialog is a second root: capture it (the window behind it is the first root).
+            val roots = onAllNodes(androidx.compose.ui.test.isRoot())
+            val bmp = (if (dialog) roots[roots.fetchSemanticsNodes().size - 1] else roots[0]).captureToImage().asSkiaBitmap()
             val data = org.jetbrains.skia.Image.makeFromBitmap(bmp).encodeToData(org.jetbrains.skia.EncodedImageFormat.PNG)!!
             File(out, "$name.png").writeBytes(data.bytes)
             println("SHOT $name ${bmp.width}x${bmp.height} -> ${File(out, "$name.png").length()} bytes")
@@ -120,6 +122,7 @@ class ScreenshotTest {
         c.blocks = Blocks(notInterested = setOf(songs[2].id), bannedArtists = setOf(songs[4].artistKey()))
         c.showToast("“${songs[2].title}” is hidden here", ToastAction("Undo") {})
         shot("8-smart-queue-feedback")
+        c.shortcutsOpen = true; shot("9-shortcuts", dialog = true); c.shortcutsOpen = false
         c.shuffleModes.clear(); c.blocks = Blocks()
         c.navigate(Route.Search); c.results = emptyList(); c.query = ""; c.queue = QueueState(); c.playback = PlayerState(); c.positionMs = 0; c.lyrics = LyricsUiState.Idle
         shot("7-empty-state")
