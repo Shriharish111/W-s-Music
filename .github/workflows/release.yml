@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Build installer
+        run: ./gradlew.bat :app:packageExe
+      - name: Rename to a stable file name
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem app/build/compose/binaries/main/exe -Filter *.exe | Select-Object -First 1
+          Copy-Item $exe.FullName WsMusic-Setup.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: WsMusic-Setup.exe
+          generate_release_notes: true

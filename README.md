@@ -7,6 +7,11 @@ same way that app does.
 > Unofficial client. It can break when YouTube changes something, and it goes against YouTube's
 > terms of service. Use it for personal use.
 
+## Download
+**[⬇ Download W's MUSIC installer for Windows (latest)](https://github.com/Shriharish111/W-s-Music/releases/latest/download/WsMusic-Setup.exe)**
+
+Run `WsMusic-Setup.exe` and follow the installer. It adds a Start menu entry and desktop shortcut, and needs no separate Java. All versions: [Releases](https://github.com/Shriharish111/W-s-Music/releases).
+
 ## Features
 - **Home** front page: quick tiles, "Made for you" mixes built from what you play, curated shelves,
   new releases, mood & genre browsing, playlist / album pages with "Save to my playlists"
