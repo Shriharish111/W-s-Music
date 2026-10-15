@@ -1,4 +1,4 @@
-﻿# W's MUSIC
+# W's MUSIC
 
 A sleek, dark "gaming" desktop music player for Windows, built with **Kotlin + Compose Desktop**.
 It is a desktop port of the Android app **Echo Music** (GPL-3.0) and talks to YouTube Music the
@@ -15,7 +15,9 @@ same way that app does.
 - **Synced lyrics** (word-by-word karaoke highlight, romanization, click a line to seek)
 - **Library**: likes, playlists, play history, stored locally in SQLite (Room)
 - **Import from the Android app**: likes, playlists and history from its `.backup` / `song.db`
-- Accent colour follows the current album art; Space = play/pause, Ctrl+←/→ = previous/next
+- Accent colour follows the current album art
+- New users: pick artists you like (or skip) and get your first mixes straight away; until then Home shows YouTube Music's popular songs
+- Keyboard shortcuts for playback, volume, shuffle, repeat, search and navigation (press Ctrl+/ for the list); hover a button for its name and shortcut; right-click a song for its options
 
 ## Build and run
 You need **JDK 21** (for example Temurin 21) and an internet connection. Nothing else.

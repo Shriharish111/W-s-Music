@@ -116,16 +116,13 @@ object ThumbCache {
     }
 }
 
-/** Placeholder art: soft gradient plus the first letter, used until (or instead of) the image. */
+/** Placeholder art: flat grey with the first letter, used until (or instead of) the image. */
 @Composable
 private fun Placeholder(seed: String, modifier: Modifier = Modifier) {
-    val h = (seed.hashCode().toLong() and 0xFFFF) / 65535f * 360f
-    val a = Color.hsv(h, 0.55f, 0.55f)
-    val b = Color.hsv((h + 50f) % 360f, 0.6f, 0.30f)
-    Box(modifier.background(Brush.linearGradient(listOf(a, b))), contentAlignment = Alignment.Center) {
+    Box(modifier.background(Ws.surfaceTop), contentAlignment = Alignment.Center) {
         Text(
             seed.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "♪",
-            style = MaterialTheme.typography.titleMedium, color = Color.White.copy(alpha = 0.75f),
+            style = MaterialTheme.typography.titleMedium, color = Ws.faint,
         )
     }
 }

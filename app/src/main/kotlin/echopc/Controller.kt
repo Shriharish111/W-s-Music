@@ -4,6 +4,8 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
@@ -17,7 +19,19 @@ import com.music.innertube.pages.BrowseResult
 import com.music.innertube.pages.HomePage
 import com.music.innertube.pages.MoodAndGenres
 import echopc.db.ImportResult
+import echopc.db.EndReason
+import echopc.db.Feedback
+import echopc.db.artistKey
+import echopc.db.GeneratedMix
 import echopc.db.LibraryRepository
+import echopc.db.StartReason
+import echopc.db.TastePick
+import echopc.db.TrackCodec
+import echopc.reco.CandidateSource
+import echopc.reco.MixKind
+import echopc.reco.Recommender
+import echopc.reco.ShelfBandit
+import echopc.reco.YouTubeCandidates
 import java.io.File
 import java.util.Properties
 import kotlinx.coroutines.CoroutineScope
@@ -28,10 +42,86 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
-enum class Section { HOME, SEARCH, LIBRARY }
-enum class PanelTab { QUEUE, LYRICS }
+/** A page of the main view. The controller keeps a back stack of these (top bar back/forward). */
+sealed interface Route {
+    data object Home : Route
+    data object Search : Route
+    data object Liked : Route
+    data object LibrarySongs : Route
+    data object History : Route
+    data object Lyrics : Route
+    data class LocalPlaylist(val id: String) : Route
+    /** A generated mix (Daily Mix, Discover Weekly, ...). */
+    data class Mix(val id: String) : Route
+    /** "Tell us what you like": pick artists to seed taste. */
+    data object Picker : Route
+    /** An online playlist / album / mood page; its content lives in [Controller.details] under [key]. */
+    data class Online(val key: String) : Route
+}
 
-/** What the Home screen shows instead of the feed while a playlist / album / mood page is open. */
+/** The "where it was played from" string stored with each play. */
+fun routeContext(r: Route): String = when (r) {
+    Route.Home -> "home"
+    Route.Search -> "search"
+    Route.Liked -> "liked"
+    Route.LibrarySongs -> "library"
+    Route.History -> "history"
+    Route.Lyrics -> "lyrics"
+    is Route.LocalPlaylist -> "local:${r.id}"
+    is Route.Online -> r.key
+    is Route.Mix -> "mix:${r.id}"
+    Route.Picker -> "picker"
+}
+
+/** What the user asked us to avoid, as quick lookups (from the `feedback` table). */
+data class Blocks(
+    val notInterested: Set<String> = emptySet(),
+    val bannedArtists: Set<String> = emptySet(),
+    val excluded: Set<String> = emptySet(),
+    val hidden: Map<String, Set<String>> = emptyMap(),
+) {
+    /** True when [song] must not play in [context] (or at all). */
+    fun blocked(song: SongItem, context: String): Boolean =
+        song.id in notInterested || song.artistKey() in bannedArtists || song.id in hidden[context].orEmpty()
+
+    companion object {
+        fun from(list: List<Feedback>) = Blocks(
+            notInterested = list.filter { it.kind == Feedback.Kind.NOT_INTERESTED }.map { it.targetId }.toSet(),
+            bannedArtists = list.filter { it.kind == Feedback.Kind.BAN_ARTIST }.map { it.targetId }.toSet(),
+            excluded = list.filter { it.kind == Feedback.Kind.EXCLUDE_FROM_TASTE }.map { it.targetId }.toSet(),
+            hidden = list.filter { it.kind == Feedback.Kind.HIDE_IN_CONTEXT }.groupBy({ it.context }, { it.targetId }).mapValues { it.value.toSet() },
+        )
+    }
+}
+
+/** A toast's button, e.g. Undo. */
+class ToastAction(val label: String, val run: () -> Unit)
+
+/**
+ * What went wrong, in words for a person. YouTube's errors arrive as raw HTTP and JSON text, which must never reach the screen.
+ * Sentence-case and without a trailing full stop, so callers can add their own advice after it.
+ */
+fun friendlyError(t: Throwable): String {
+    // Class names count too: an UnknownHostException's message is only the host name.
+    val text = generateSequence(t) { it.cause }.joinToString(" ") { "${it::class.simpleName} ${it.message.orEmpty()}" }.lowercase()
+    return when {
+        listOf("unknownhost", "connectexception", "unable to resolve", "no address associated", "network is unreachable", "no route to host", "connection refused", "failed to connect", "connect timed out", "unresolved")
+            .any { it in text } -> "There's no internet connection"
+        listOf("429", "too many requests", "quota").any { it in text } -> "YouTube Music is busy right now"
+        listOf("500", "502", "503", "504", "unavailable", "backenderror", "bad gateway").any { it in text } -> "YouTube Music is temporarily unavailable"
+        "timeout" in text || "timed out" in text -> "The connection is too slow right now"
+        else -> "Something went wrong loading this"
+    }
+}
+
+/** What the right-hand panel shows. */
+enum class PanelTab { NOW_PLAYING, QUEUE }
+
+/** Library sidebar width limits in dp (it can also collapse to an icon strip). */
+const val SIDEBAR_MIN = 240f
+const val SIDEBAR_MAX = 440f
+
+/** Content of an online playlist / album / mood page. */
 sealed interface DetailUi {
     val title: String
     data class Loading(override val title: String) : DetailUi
@@ -75,14 +165,22 @@ class Controller(
     private val scope: CoroutineScope,
     val library: LibraryRepository,
     private val settingsFile: File? = null,
+    recoSource: CandidateSource? = null,
+    discoverySource: DiscoverySource? = null,
     engineFactory: (onState: (PlayerState) -> Unit, onEnded: () -> Unit) -> PlayerEngine,
 ) {
     // ---- navigation ----
-    var section by mutableStateOf(Section.HOME)
-    var libraryTab by mutableStateOf(0)
-    var openPlaylistId by mutableStateOf<String?>(null)
+    var backStack by mutableStateOf<List<Route>>(listOf(Route.Home))
+        private set
+    private var forwardStack by mutableStateOf<List<Route>>(emptyList())
+    val route: Route get() = backStack.last()
+    val canGoBack: Boolean get() = backStack.size > 1
+    val canGoForward: Boolean get() = forwardStack.isNotEmpty()
+    val details = mutableStateMapOf<String, DetailUi>()
     var panelOpen by mutableStateOf(true)
-    var panelTab by mutableStateOf(PanelTab.QUEUE)
+    var panelTab by mutableStateOf(PanelTab.NOW_PLAYING)
+    var sidebarWidth by mutableFloatStateOf(300f) // dp
+    var sidebarCollapsed by mutableStateOf(false)
 
     // ---- home feed ----
     var homeSections by mutableStateOf<List<HomePage.Section>>(emptyList())
@@ -94,7 +192,6 @@ class Controller(
     var homeLoadingMore by mutableStateOf(false)
     var newReleases by mutableStateOf<List<AlbumItem>>(emptyList())
     var moods by mutableStateOf<List<MoodAndGenres.Item>>(emptyList())
-    var detail by mutableStateOf<DetailUi?>(null)
 
     // ---- search ----
     var query by mutableStateOf("")
@@ -113,15 +210,67 @@ class Controller(
     var lyrics by mutableStateOf<LyricsUiState>(LyricsUiState.Idle)
     var accent by mutableStateOf(Accent(Ws.defaultAccent, Ws.defaultAccent2))
     var toast by mutableStateOf<String?>(null)
+    var toastAction by mutableStateOf<ToastAction?>(null)
     var importUi by mutableStateOf<ImportUi>(ImportUi.Idle)
     var likedIds by mutableStateOf<Set<String>>(emptySet())
     var newPlaylistFor by mutableStateOf<SongItem?>(null) // song to add once created
     var newPlaylistOpen by mutableStateOf(false)
     var typing by mutableStateOf(false) // a text field has focus: keyboard shortcuts stand down
 
+    // ---- recommendations ----
+    val recommender = Recommender(library, recoSource ?: YouTubeCandidates(library))
+    var mixes by mutableStateOf<List<GeneratedMix>>(emptyList())
+    var mixesRefreshing by mutableStateOf(false)
+    private var signalsSinceRefresh = 0
+    private val bandit = ShelfBandit()
+    private var shelfStats: Map<String, Pair<Long, Long>> = emptyMap()
+    private var shelfOrder: List<String> = emptyList()
+    private val shelfImpressions = HashSet<String>()
+
+    // ---- new users: popular songs and picking artists ----
+    val discovery: DiscoverySource = discoverySource ?: YouTubeDiscovery(library)
+    var popularNow by mutableStateOf<PopularNow?>(null)
+    var popularLoading by mutableStateOf(false)
+        private set
+    var tastePicks by mutableStateOf<List<TastePick>>(emptyList())
+    /** "Not now" (or a finished pick) on the Home card; remembered across launches. */
+    var tastePromptDismissed by mutableStateOf(false)
+    var suggestedArtists by mutableStateOf<List<ArtistItem>>(emptyList())
+    var suggestedLoading by mutableStateOf(false)
+    val pickerSelected = mutableStateListOf<ArtistItem>()
+    var pickerSimilar by mutableStateOf<List<ArtistItem>>(emptyList())
+    var pickerQuery by mutableStateOf("")
+    var pickerResults by mutableStateOf<List<ArtistItem>>(emptyList())
+    var pickerSearching by mutableStateOf(false)
+    private var pickerSearchJob: Job? = null
+    /** False until the stored mixes have been read once, so Home doesn't treat "not loaded yet" as "no mixes". */
+    var mixesLoaded by mutableStateOf(false)
+
+    // ---- keyboard shortcuts ----
+    var shortcutsOpen by mutableStateOf(false)
+    /** Bumped by Ctrl+L; the search box focuses itself when it changes. */
+    var searchFocusTick by mutableStateOf(0)
+    private var volumeBeforeMute = 0.8f
+
+    // ---- feedback & shuffle ----
+    var blocks by mutableStateOf(Blocks())
+    /** Shuffle mode per play context (only non-OFF entries are kept). */
+    val shuffleModes = mutableStateMapOf<String, ShuffleMode>()
+    var smartLoading by mutableStateOf(false)
+    /** The list the current queue was started from, in its own order (for turning shuffle off). */
+    private var queueOriginal: List<SongItem> = emptyList()
+
     private val engine: PlayerEngine = engineFactory(::onEngineState, ::onEnded)
     private var playingSong: SongItem? = null
     private var playedMax = 0L
+    private var playStartReason = StartReason.CLICK_ROW
+    private var playContext = "home"
+    /** Where the current queue came from ("liked", "local:<id>", "mix:<id>", ...); radio additions are "radio". */
+    var queueContext = "home"
+        private set
+    private val radioIds = HashSet<String>()
+    /** Play logging: one worker runs the writes strictly in the order plays end. */
+    private val playLog = kotlinx.coroutines.channels.Channel<suspend () -> Unit>(kotlinx.coroutines.channels.Channel.UNLIMITED)
     private var sideJob: Job? = null
     private var lyricsJob: Job? = null
     private var toastJob: Job? = null
@@ -130,6 +279,17 @@ class Controller(
         loadSettings()
         engine.setVolume(volume.toDouble())
         scope.launch { library.likedIds.collect { likedIds = it.toSet() } }
+        scope.launch {
+            library.mixes.collect {
+                mixes = it; mixesLoaded = true
+                // No mixes yet: Home needs something to show. Start the popular songs (and the picker's artists) right away.
+                if (it.isEmpty()) { loadPopular(); if (!tastePromptDismissed) prefetchSuggestedArtists() }
+            }
+        }
+        scope.launch { library.tastePicks.collect { tastePicks = it } }
+        scope.launch { library.feedback.collect { blocks = Blocks.from(it) } }
+        scope.launch { loadShelfStats() }
+        scope.launch(Dispatchers.IO) { for (write in playLog) runCatching { write() } }
     }
 
     // ---------------- engine callbacks ----------------
@@ -145,22 +305,57 @@ class Controller(
 
     // ---------------- playback control ----------------
 
-    /** Logs the song that just finished/was left, if it was listened to for at least 10 s. */
-    private fun flushPlay() {
-        val song = playingSong
+    /**
+     * Closes the play that is ending: a taste signal for any play (a quick skip is a strong signal),
+     * and a history entry if it was listened to for at least 10 s.
+     */
+    private fun flushPlay(endReason: String) {
+        val song = playingSong ?: return
         val ms = playedMax
+        val duration = playback.durationMs.takeIf { it > 0 } ?: ((song.duration ?: 0) * 1000L)
+        val reason = if (playback.error != null) EndReason.ERROR else endReason
+        val start = playStartReason; val context = playContext
+        val at = java.time.LocalDateTime.now()
         playedMax = 0
-        if (song != null && ms >= 10_000) scope.launch { runCatching { library.recordPlay(song, ms) } }
+        playingSong = null
+        playLog.trySend {
+            if (ms >= 10_000) library.recordPlay(song, ms)
+            if (ms > 0 || reason == EndReason.FWD_BUTTON) {
+                library.recordSignal(song, ms, duration, start, reason, context, at)
+                onSignalRecorded()
+            }
+        }
     }
 
-    fun startCurrent() {
+    /** Starts the queue's current song; [start] says why it starts, [ended] why the previous one stopped. */
+    fun startCurrent(start: String = StartReason.CLICK_ROW, ended: String = EndReason.NEW_SELECTION, backwards: Boolean = false) {
+        if (queue.current == null) return
+        // Hidden songs and blocked artists are passed over, like Spotify does.
+        val target = playableIndex(queue.index, backwards)
+        if (target == null) {
+            flushPlay(ended); engine.stop()
+            showToast("Nothing here can play: these songs are hidden or by artists you blocked")
+            return
+        }
+        if (target != queue.index) queue = queue.jump(target)
         val song = queue.current ?: return
-        flushPlay()
+        flushPlay(ended)
         playingSong = song
+        playStartReason = if (song.id in queue.recommended) StartReason.SMART_SHUFFLE else start
+        playContext = if (song.id in radioIds) "radio" else queueContext
         positionMs = 0
         engine.play(song.id, queue.upNext?.id)
-        if (queue.upNext == null && autoplay) extendWithRadio(song, thenPlayFirstNew = false)
+        if (queue.upNext == null && autoplay) extendWithRadio(song, thenPlayFirstNew = false, ended = ended)
         loadSideEffects(song)
+    }
+
+    /** First playable position from [from], searching forward (or backward first for Previous). */
+    private fun playableIndex(from: Int, backwards: Boolean): Int? {
+        val items = queue.items
+        if (from !in items.indices) return null
+        val forward = (from until items.size) + if (queue.repeat == RepeatMode.ALL) (0 until from).toList() else emptyList()
+        val order = if (backwards) (from downTo 0) + (from + 1 until items.size) else forward
+        return order.firstOrNull { !blocks.blocked(items[it], queueContext) }
     }
 
     private fun loadSideEffects(song: SongItem) {
@@ -173,36 +368,106 @@ class Controller(
         }
     }
 
-    private fun extendWithRadio(after: SongItem, thenPlayFirstNew: Boolean) {
+    private fun extendWithRadio(after: SongItem, thenPlayFirstNew: Boolean, ended: String) {
         scope.launch {
-            val radio = fetchRadio(after).filter { r -> queue.items.none { it.id == r.id } }
+            val radio = fetchRadio(after).filter { r -> queue.items.none { it.id == r.id } && !blocks.blocked(r, "radio") }
             if (radio.isEmpty()) return@launch
+            radioIds += radio.map { it.id }
             val firstNew = queue.items.size
             queue = queue.copy(items = queue.items + radio)
-            if (thenPlayFirstNew) { queue = queue.jump(firstNew); startCurrent() } else engine.prefetch(radio.first().id)
+            if (thenPlayFirstNew) { queue = queue.jump(firstNew); startCurrent(StartReason.AUTOPLAY, ended) } else engine.prefetch(radio.first().id)
         }
     }
 
     fun skipNext(auto: Boolean = false) {
         val ni = queue.nextIndex(auto)
+        val reason = if (auto) EndReason.TRACK_DONE else EndReason.FWD_BUTTON
         when {
-            ni != null -> { queue = queue.jump(ni); startCurrent() }
-            autoplay && queue.current != null -> extendWithRadio(queue.current!!, thenPlayFirstNew = true)
-            else -> { flushPlay(); playingSong = null; engine.stop() }
+            ni != null -> { queue = queue.jump(ni); startCurrent(if (auto) StartReason.TRACK_DONE else StartReason.FWD_BUTTON, reason) }
+            autoplay && queue.current != null -> extendWithRadio(queue.current!!, thenPlayFirstNew = true, ended = reason)
+            else -> { flushPlay(reason); engine.stop() }
         }
     }
 
     fun skipPrevious() {
         if (positionMs > 3000) { seek(0); return }
-        queue.previousIndex()?.let { queue = queue.jump(it); startCurrent() }
+        queue.previousIndex()?.let { queue = queue.jump(it); startCurrent(StartReason.BACK_BUTTON, EndReason.BACK_BUTTON, backwards = true) }
     }
 
     fun togglePause() = engine.togglePause()
+
+    fun toggleMute() {
+        if (volume == 0f) changeVolume(volumeBeforeMute.coerceAtLeast(0.05f))
+        else { volumeBeforeMute = volume; changeVolume(0f) }
+    }
+
+    /** Runs a keyboard shortcut (see [Shortcut]); the same actions as the buttons. */
+    fun perform(shortcut: Shortcut) {
+        when (shortcut) {
+            Shortcut.PLAY_PAUSE -> togglePause()
+            Shortcut.NEXT -> skipNext()
+            Shortcut.PREVIOUS -> skipPrevious()
+            Shortcut.SEEK_FORWARD -> seekBy(5_000)
+            Shortcut.SEEK_BACK -> seekBy(-5_000)
+            Shortcut.VOLUME_UP -> nudgeVolume(+0.1f)
+            Shortcut.VOLUME_DOWN -> nudgeVolume(-0.1f)
+            Shortcut.MUTE -> toggleMute()
+            Shortcut.SHUFFLE -> {
+                cycleShuffle()
+                showToast(when (shuffleMode()) { ShuffleMode.OFF -> "Shuffle off"; ShuffleMode.ON -> "Shuffle on"; ShuffleMode.SMART -> "Smart Shuffle on" })
+            }
+            Shortcut.REPEAT -> {
+                cycleRepeat()
+                showToast(when (queue.repeat) { RepeatMode.OFF -> "Repeat off"; RepeatMode.ALL -> "Repeat all"; RepeatMode.ONE -> "Repeat this song" })
+            }
+            Shortcut.LIKE -> queue.current?.let { toggleLike(it) }
+            Shortcut.SEARCH -> { navigate(Route.Search); searchFocusTick++ }
+            Shortcut.BACK -> goBack()
+            Shortcut.FORWARD -> goForward()
+            Shortcut.HELP -> shortcutsOpen = !shortcutsOpen
+        }
+    }
+
+    private fun seekBy(deltaMs: Long) {
+        val duration = playback.durationMs
+        if (queue.current == null || duration <= 0) return
+        seek((positionMs + deltaMs).coerceIn(0L, duration))
+    }
+
+    private fun nudgeVolume(delta: Float) {
+        changeVolume((volume + delta).coerceIn(0f, 1f))
+        showToast("Volume ${(volume * 100).toInt()}%")
+    }
     fun seek(ms: Long) { positionMs = ms; engine.seek(ms) }
     fun changeVolume(v: Float) { volume = v; engine.setVolume(v.toDouble()) }
 
-    fun playFromList(list: List<SongItem>, index: Int) { queue = queue.withItems(list, index); startCurrent() }
-    fun playShuffled(list: List<SongItem>) { if (list.isNotEmpty()) playFromList(list.shuffled(), 0) }
+    /** Plays [list] from [index]; the page it was started from becomes the play context. */
+    fun playFromList(list: List<SongItem>, index: Int, context: String = routeContext(route)) {
+        queueContext = context
+        radioIds.clear()
+        queueOriginal = list
+        val mode = shuffleMode(context)
+        queue = queue.withItems(list, index).copy(recommended = emptySet())
+        if (mode != ShuffleMode.OFF && index in list.indices) {
+            // The song you picked plays first; everything else (including songs listed before it) is shuffled.
+            queue = queue.copy(items = listOf(list[index]) + list.filterIndexed { i, _ -> i != index }.shuffled(), index = 0)
+        }
+        startCurrent()
+        if (mode == ShuffleMode.SMART) addSmartRecommendations()
+    }
+
+    /** A page's big play button: from the top, or from a random song when shuffle is on for that page. */
+    fun playCollection(list: List<SongItem>, context: String = routeContext(route)) {
+        if (list.isEmpty()) return
+        playFromList(list, if (shuffleMode(context) == ShuffleMode.OFF) 0 else list.indices.random(), context)
+    }
+
+    fun playShuffled(list: List<SongItem>) {
+        if (list.isEmpty()) return
+        val ctx = routeContext(route)
+        if (shuffleMode(ctx) == ShuffleMode.OFF) shuffleModes[ctx] = ShuffleMode.ON
+        playCollection(list, ctx)
+    }
     fun jumpTo(index: Int) { queue = queue.jump(index); startCurrent() }
 
     fun addToQueue(song: SongItem) {
@@ -218,9 +483,153 @@ class Controller(
     fun removeFromQueue(position: Int) { queue = queue.remove(position) }
     fun shuffleQueue() { queue = queue.shuffledUpcoming(); queue.upNext?.let { engine.prefetch(it.id) } }
     fun clearQueue() {
-        flushPlay(); playingSong = null; engine.stop(); queue = QueueState(); lyrics = LyricsUiState.Idle
+        flushPlay(EndReason.CLOSED); engine.stop(); queue = QueueState(); lyrics = LyricsUiState.Idle
         accent = Accent(Ws.defaultAccent, Ws.defaultAccent2)
     }
+    // ---------------- shuffle & Smart Shuffle ----------------
+
+    fun shuffleMode(context: String = queueContext): ShuffleMode = shuffleModes[context] ?: ShuffleMode.OFF
+
+    /** Smart Shuffle is for collections (playlists, albums, mixes, liked songs), not radio or search results. */
+    fun smartAvailable(context: String): Boolean =
+        context == "liked" || context == "library" || listOf("local:", "playlist:", "album:", "mix:").any { context.startsWith(it) }
+
+    /** Shuffle button: off -> shuffle -> Smart Shuffle -> off (Smart only where it applies). */
+    fun cycleShuffle(context: String = queueContext) {
+        val next = when (shuffleMode(context)) {
+            ShuffleMode.OFF -> ShuffleMode.ON
+            ShuffleMode.ON -> if (smartAvailable(context)) ShuffleMode.SMART else ShuffleMode.OFF
+            ShuffleMode.SMART -> ShuffleMode.OFF
+        }
+        setShuffle(context, next)
+    }
+
+    fun setShuffle(context: String, mode: ShuffleMode) {
+        if (mode == ShuffleMode.OFF) shuffleModes.remove(context) else shuffleModes[context] = mode
+        if (context != queueContext || queue.items.isEmpty()) return // applies next time this list plays
+        when (mode) {
+            ShuffleMode.OFF -> {
+                val had = queue.recommended.isNotEmpty()
+                queue = queue.linear(queueOriginal)
+                if (had) showToast("Removed Smart Shuffle recommendations")
+            }
+            ShuffleMode.ON -> queue = queue.withoutRecommendations().shuffledUpcoming()
+            ShuffleMode.SMART -> addSmartRecommendations()
+        }
+        queue.upNext?.let { engine.prefetch(it.id) }
+    }
+
+    /** Fetches today's recommendations for the current list and mixes them in (one after every three songs). */
+    private fun addSmartRecommendations() {
+        val ctx = queueContext
+        val songs = queueOriginal
+        smartLoading = true
+        scope.launch(Dispatchers.IO) {
+            val count = ((songs.size + 2) / 3).coerceIn(1, 30)
+            val recs = runCatching { recommender.smartShuffle(ctx, songs, count) }.getOrDefault(emptyList())
+            smartLoading = false
+            if (queueContext != ctx || shuffleMode(ctx) != ShuffleMode.SMART) return@launch
+            queue = queue.withSmartShuffle(recs.filter { !blocks.blocked(it, ctx) })
+            queue.upNext?.let { engine.prefetch(it.id) }
+            val added = queue.recommended.size
+            showToast(
+                when (added) {
+                    0 -> "Couldn't find Smart Shuffle recommendations right now, so this is a plain shuffle"
+                    1 -> "Added 1 Smart Shuffle recommendation to the queue"
+                    else -> "Added $added Smart Shuffle recommendations to the queue"
+                },
+            )
+        }
+    }
+
+    /** Queue row: drop a recommendation, and don't suggest it for this list again. */
+    fun removeRecommendation(position: Int) {
+        val song = queue.items.getOrNull(position)?.takeIf { it.id in queue.recommended } ?: return
+        val ctx = queueContext
+        queue = queue.remove(position).let { it.copy(recommended = it.recommended - song.id) }
+        scope.launch { library.addFeedback(song.id, Feedback.Kind.HIDE_IN_CONTEXT, ctx) }
+        showToast("Removed “${song.title}”")
+    }
+
+    /** Queue row: keep a recommendation by adding it to the playlist it was recommended for. */
+    fun addRecommendationToPlaylist(position: Int) {
+        val song = queue.items.getOrNull(position)?.takeIf { it.id in queue.recommended } ?: return
+        val playlistId = queueContext.removePrefix("local:").takeIf { queueContext.startsWith("local:") } ?: return
+        queue = queue.copy(recommended = queue.recommended - song.id)
+        queueOriginal = queueOriginal + song
+        scope.launch { library.addToPlaylist(playlistId, song); showToast("Added “${song.title}” to the playlist") }
+    }
+
+    /** True when the current queue's recommendations can be saved to a playlist (only your own playlists). */
+    val canKeepRecommendations: Boolean get() = queueContext.startsWith("local:")
+
+    // ---------------- feedback ----------------
+
+    fun notInterested(song: SongItem) {
+        scope.launch { library.addFeedback(song.id, Feedback.Kind.NOT_INTERESTED) }
+        queue = queue.withoutUpcoming { it.id == song.id }
+        showToast("You won't get “${song.title}” in recommendations", ToastAction("Undo") {
+            scope.launch { library.removeFeedback(song.id, Feedback.Kind.NOT_INTERESTED) }
+        })
+    }
+
+    /** Label for "hide here", or null where hiding makes no sense (search, history, Liked Songs...). */
+    fun hideLabel(context: String): String? = when {
+        context.startsWith("local:") || context.startsWith("playlist:") -> "Hide from this playlist"
+        context.startsWith("mix:") -> "Hide from this mix"
+        context.startsWith("album:") -> "Hide from this album"
+        else -> null
+    }
+
+    fun hideInContext(song: SongItem, context: String) {
+        scope.launch { library.addFeedback(song.id, Feedback.Kind.HIDE_IN_CONTEXT, context) }
+        if (queueContext == context) {
+            queue = queue.withoutUpcoming { it.id == song.id }
+            if (queue.current?.id == song.id) skipNext()
+        }
+        showToast("“${song.title}” is hidden here", ToastAction("Undo") {
+            scope.launch { library.removeFeedback(song.id, Feedback.Kind.HIDE_IN_CONTEXT, context) }
+        })
+    }
+
+    fun banArtist(song: SongItem) {
+        val key = song.artistKey()
+        val name = song.artists.firstOrNull()?.name ?: "this artist"
+        scope.launch { library.addFeedback(key, Feedback.Kind.BAN_ARTIST) }
+        queue = queue.withoutUpcoming { it.artistKey() == key }
+        if (queue.current?.artistKey() == key) skipNext()
+        showToast("We won't play $name", ToastAction("Undo") {
+            scope.launch { library.removeFeedback(key, Feedback.Kind.BAN_ARTIST) }
+        })
+    }
+
+    fun recommendAgain(song: SongItem) {
+        scope.launch { library.removeFeedback(song.id, Feedback.Kind.NOT_INTERESTED) }
+        showToast("“${song.title}” can be recommended again")
+    }
+
+    fun allowArtist(song: SongItem) {
+        scope.launch { library.removeFeedback(song.artistKey(), Feedback.Kind.BAN_ARTIST) }
+        showToast("${song.artists.firstOrNull()?.name ?: "This artist"} can play again")
+    }
+
+    fun unhideInContext(song: SongItem, context: String) {
+        scope.launch { library.removeFeedback(song.id, Feedback.Kind.HIDE_IN_CONTEXT, context) }
+        showToast("“${song.title}” is back")
+    }
+
+    fun toggleExcludeFromTaste(song: SongItem) {
+        if (song.id in blocks.excluded) {
+            scope.launch { library.removeFeedback(song.id, Feedback.Kind.EXCLUDE_FROM_TASTE) }
+            showToast("“${song.title}” counts toward your taste again")
+        } else {
+            scope.launch { library.addFeedback(song.id, Feedback.Kind.EXCLUDE_FROM_TASTE) }
+            showToast("“${song.title}” will barely affect your recommendations", ToastAction("Undo") {
+                scope.launch { library.removeFeedback(song.id, Feedback.Kind.EXCLUDE_FROM_TASTE) }
+            })
+        }
+    }
+
     fun cycleRepeat() { queue = queue.copy(repeat = RepeatMode.entries[(queue.repeat.ordinal + 1) % RepeatMode.entries.size]) }
 
     // ---------------- home feed ----------------
@@ -228,19 +637,37 @@ class Controller(
     /** Loads the YouTube Music home feed (optionally filtered by a mood chip) plus new releases and moods. */
     fun loadHome(chip: HomePage.Chip? = null) {
         homeChip = chip
+        shelfOrder = emptyList(); shelfImpressions.clear()
+        scope.launch { loadShelfStats() }
         homeLoading = true; homeError = null
+        homeRetryJob?.cancel()
         scope.launch {
             YouTube.home(browseId = chip?.endpoint?.browseId ?: "FEmusic_home", params = chip?.endpoint?.params)
                 .onSuccess { page ->
                     homeSections = page.sections
                     homeMore = page.continuation
                     if (!page.chips.isNullOrEmpty()) homeChips = page.chips!!
+                    homeRetries = 0
+                    if (mixesLoaded && mixes.isEmpty()) loadPopular() // the connection is back: fill any gap
                 }
-                .onFailure { homeError = it.message ?: "Couldn't load the home feed" }
+                .onFailure { homeError = friendlyError(it); scheduleHomeRetry(chip) }
             homeLoading = false
         }
         if (newReleases.isEmpty() && moods.isEmpty()) scope.launch {
             YouTube.explore().onSuccess { e -> newReleases = e.newReleaseAlbums; moods = e.moodAndGenres }
+        }
+    }
+
+    private var homeRetryJob: Job? = null
+    private var homeRetries = 0
+
+    /** A failed feed tries again by itself (15 s, 30 s, 60 s, 2 min), so Home fills in as soon as YouTube is back. */
+    private fun scheduleHomeRetry(chip: HomePage.Chip?) {
+        if (homeRetries >= 4) return
+        val wait = 15_000L shl homeRetries++
+        homeRetryJob = scope.launch {
+            delay(wait)
+            if (homeSections.isEmpty()) loadHome(chip)
         }
     }
 
@@ -262,52 +689,75 @@ class Controller(
         }
     }
 
-    fun closeDetail() { detail = null }
+    // ---------------- navigation ----------------
 
-    fun openPlaylist(p: PlaylistItem) {
-        detail = DetailUi.Loading(p.title)
-        scope.launch {
-            YouTube.playlist(p.id)
-                .onSuccess { page ->
-                    val songs = page.songs.toMutableList()
-                    var next = page.songsContinuation ?: page.continuation
-                    var pages = 0
-                    while (next != null && pages < 4) { // long playlists: pull a few more pages
-                        val more = YouTube.playlistContinuation(next).getOrNull() ?: break
-                        songs += more.songs; next = more.continuation; pages++
-                    }
-                    detail = DetailUi.Songs(
-                        page.playlist.title.ifBlank { p.title }, "Playlist",
-                        listOfNotNull(page.playlist.author?.name, "${songs.size} songs").joinToString(" · "),
-                        page.playlist.thumbnail ?: p.thumbnail, songs.distinctBy { it.id },
-                    )
-                }
-                .onFailure { detail = DetailUi.Failed(p.title, it.message ?: "Couldn't open this playlist") }
-        }
+    /** Opens [to] in the main view. Re-opening the current page does nothing. */
+    fun navigate(to: Route) {
+        if (route == to) return
+        backStack = backStack + to
+        forwardStack = emptyList()
     }
 
-    fun openAlbum(a: AlbumItem) {
-        detail = DetailUi.Loading(a.title)
-        scope.launch {
-            YouTube.album(a.browseId)
-                .onSuccess { page ->
-                    detail = DetailUi.Songs(
-                        page.album.title.ifBlank { a.title }, "Album",
-                        listOfNotNull(page.album.artists?.joinToString { it.name }, page.album.year?.toString(), "${page.songs.size} songs").joinToString(" · "),
-                        page.album.thumbnail.ifBlank { a.thumbnail }, page.songs,
-                    )
-                }
-                .onFailure { detail = DetailUi.Failed(a.title, it.message ?: "Couldn't open this album") }
-        }
+    fun goBack() {
+        if (!canGoBack) return
+        forwardStack = listOf(route) + forwardStack
+        backStack = backStack.dropLast(1)
     }
 
-    fun openMood(item: MoodAndGenres.Item) {
-        detail = DetailUi.Loading(item.title)
-        scope.launch {
-            YouTube.browse(item.endpoint.browseId, item.endpoint.params)
-                .onSuccess { r -> detail = DetailUi.Collection(r.title ?: item.title, r.items.filter { it.items.isNotEmpty() }) }
-                .onFailure { detail = DetailUi.Failed(item.title, it.message ?: "Couldn't open this category") }
+    fun goForward() {
+        val next = forwardStack.firstOrNull() ?: return
+        forwardStack = forwardStack.drop(1)
+        backStack = backStack + next
+    }
+
+    /** Home button: Home without wiping history (like a browser's home button). */
+    fun goHome() = navigate(Route.Home)
+
+    /** Lyrics live in the main view; the player bar button toggles them. */
+    fun toggleLyrics() = if (route == Route.Lyrics) goBack() else navigate(Route.Lyrics)
+
+    /** Player bar buttons for the right panel: open on [tab], or close it if it already shows [tab]. */
+    fun togglePanel(tab: PanelTab) {
+        if (panelOpen && panelTab == tab) panelOpen = false else { panelTab = tab; panelOpen = true }
+    }
+
+    /** Shows [ui] as an online page (also used by tests to show a page without the network). */
+    fun showDetail(key: String, ui: DetailUi) { details[key] = ui; navigate(Route.Online(key)) }
+
+    private fun loadDetail(key: String, title: String, load: suspend () -> DetailUi) {
+        details[key] = DetailUi.Loading(title)
+        navigate(Route.Online(key))
+        scope.launch { details[key] = runCatching { load() }.getOrElse { DetailUi.Failed(title, friendlyError(it)) } }
+    }
+
+    fun openPlaylist(p: PlaylistItem) = loadDetail("playlist:${p.id}", p.title) {
+        val page = YouTube.playlist(p.id).getOrThrow()
+        val songs = page.songs.toMutableList()
+        var next = page.songsContinuation ?: page.continuation
+        var pages = 0
+        while (next != null && pages < 4) { // long playlists: pull a few more pages
+            val more = YouTube.playlistContinuation(next).getOrNull() ?: break
+            songs += more.songs; next = more.continuation; pages++
         }
+        DetailUi.Songs(
+            page.playlist.title.ifBlank { p.title }, "Playlist",
+            listOfNotNull(page.playlist.author?.name, "${songs.size} songs").joinToString(" • "),
+            page.playlist.thumbnail ?: p.thumbnail, songs.distinctBy { it.id },
+        )
+    }
+
+    fun openAlbum(a: AlbumItem) = loadDetail("album:${a.browseId}", a.title) {
+        val page = YouTube.album(a.browseId).getOrThrow()
+        DetailUi.Songs(
+            page.album.title.ifBlank { a.title }, "Album",
+            listOfNotNull(page.album.artists?.joinToString { it.name }, page.album.year?.toString(), "${page.songs.size} songs").joinToString(" • "),
+            page.album.thumbnail.ifBlank { a.thumbnail }, page.songs,
+        )
+    }
+
+    fun openMood(item: MoodAndGenres.Item) = loadDetail("mood:${item.endpoint.browseId}:${item.endpoint.params}", item.title) {
+        val r = YouTube.browse(item.endpoint.browseId, item.endpoint.params).getOrThrow()
+        DetailUi.Collection(r.title ?: item.title, r.items.filter { it.items.isNotEmpty() })
     }
 
     /** Click on a card: open playlists/albums, play songs from their shelf, search for artists. */
@@ -342,7 +792,7 @@ class Controller(
             showToast("Building your mix…")
             val radio = fetchRadio(seed)
             if (radio.isEmpty()) { showToast("Couldn't build a mix right now"); return@launch }
-            playFromList(listOf(seed) + radio.take(49), 0)
+            playFromList(listOf(seed) + radio.take(49), 0, context = "radio")
         }
     }
 
@@ -354,25 +804,166 @@ class Controller(
         }
     }
 
+    // ---------------- recommendations ----------------
+
+    /** Rebuilds whatever mixes are due (in the background); [force] rebuilds all of them. */
+    fun refreshMixes(force: Boolean = false) {
+        if (mixesRefreshing) { if (force) refreshAgain = true; return } // a forced rebuild waits for the running one
+        mixesRefreshing = true
+        signalsSinceRefresh = 0
+        scope.launch(Dispatchers.IO) {
+            runCatching { recommender.refresh(force) }.onFailure { println("[reco] refresh failed: ${it.message}") }
+            mixesRefreshing = false
+            if (refreshAgain) { refreshAgain = false; refreshMixes(force = true) }
+        }
+    }
+    private var refreshAgain = false
+
+    // ---------------- new users: popular songs and picking artists ----------------
+
+    /** Loads "Popular right now" (YouTube Music's hit playlist) once; Home shows it until there are mixes. */
+    fun loadPopular() {
+        if (popularNow != null || popularLoading) return
+        popularLoading = true
+        scope.launch(Dispatchers.IO) {
+            // A flaky connection should not leave Home bare: try a few times before giving up.
+            for (attempt in 1..3) {
+                popularNow = runCatching { discovery.popularNow() }.getOrNull()
+                if (popularNow != null) break
+                delay(1_500L * attempt)
+            }
+            popularLoading = false
+        }
+    }
+
+    /** Opens the artist picker, with the current picks already selected. */
+    fun openPicker() {
+        pickerSelected.clear()
+        pickerSelected += tastePicks.map { ArtistItem(id = it.artistKey, title = it.name, thumbnail = it.thumbnail.ifBlank { null }, shuffleEndpoint = null, radioEndpoint = null) }
+        pickerQuery = ""; pickerResults = emptyList(); pickerSimilar = emptyList()
+        navigate(Route.Picker)
+        prefetchSuggestedArtists()
+    }
+
+    /** Looks up the picker's starter artists (about 5 s the first time), so Home can have them ready before anyone opens the picker. */
+    fun prefetchSuggestedArtists() {
+        if (suggestedArtists.isNotEmpty() || suggestedLoading) return
+        suggestedLoading = true
+        scope.launch(Dispatchers.IO) {
+            suggestedArtists = runCatching { discovery.suggestedArtists() }.getOrDefault(emptyList())
+            suggestedLoading = false
+        }
+    }
+
+    /** Picks or un-picks an artist; picking one suggests artists fans of it also like. */
+    fun togglePick(artist: ArtistItem) {
+        val at = pickerSelected.indexOfFirst { it.id == artist.id }
+        if (at >= 0) { pickerSelected.removeAt(at); return }
+        pickerSelected += artist
+        scope.launch(Dispatchers.IO) {
+            val similar = runCatching { discovery.similarArtists(artist.id) }.getOrDefault(emptyList())
+            val have = (pickerSelected.map { it.id } + pickerSimilar.map { it.id } + suggestedArtists.map { it.id }).toSet()
+            pickerSimilar = (pickerSimilar + similar.filter { it.id !in have }).take(24)
+        }
+    }
+
+    fun searchPickerArtists(query: String) {
+        pickerQuery = query
+        pickerSearchJob?.cancel()
+        if (query.isBlank()) { pickerResults = emptyList(); pickerSearching = false; return }
+        pickerSearching = true
+        pickerSearchJob = scope.launch(Dispatchers.IO) {
+            delay(300) // wait for a pause in typing
+            pickerResults = runCatching { discovery.searchArtists(query) }.getOrDefault(emptyList())
+            pickerSearching = false
+        }
+    }
+
+    /** Done: keep the picks, hide the Home card and build the first mixes from them right away. */
+    fun savePicks() {
+        if (pickerSelected.isEmpty()) return
+        val chosen = pickerSelected.toList()
+        tastePromptDismissed = true
+        scope.launch {
+            val now = java.time.LocalDateTime.now()
+            library.replaceTastePicks(chosen.map { TastePick(it.id, it.title, it.thumbnail.orEmpty(), now) })
+            recommender.invalidateEmpty()
+            refreshMixes(force = true)
+        }
+        showToast("Thanks! Building your first mixes now")
+        leavePicker()
+    }
+
+    /** Skip: nothing is saved; the Home card stays away. */
+    fun skipPicker() { tastePromptDismissed = true; leavePicker() }
+
+    fun dismissTastePrompt() { tastePromptDismissed = true }
+
+    private fun leavePicker() { if (route == Route.Picker) { if (canGoBack) goBack() else navigate(Route.Home) } }
+
+    /** True while the taste-based mixes don't exist yet (a new user): worth trying again sooner. */
+    private fun tasteMixesMissing() = listOf(MixKind.DAILY, MixKind.DISCOVER).any { k -> mixes.none { it.kind == k } }
+
+    private fun onSignalRecorded() {
+        // Plenty of new listening: let the mixes catch up without waiting for tomorrow. A user who has
+        // no taste mixes yet gets them after just a few plays.
+        if (++signalsSinceRefresh >= (if (tasteMixesMissing()) Recommender.RETRY_AFTER_SIGNALS else 20)) refreshMixes()
+    }
+
+    fun mixSongs(mix: GeneratedMix): List<SongItem> = TrackCodec.decode(mix.songs)
+
+    fun playGeneratedMix(mix: GeneratedMix) {
+        val songs = mixSongs(mix)
+        if (songs.isNotEmpty()) playFromList(songs, 0, context = "mix:${mix.id}")
+    }
+
+    private suspend fun loadShelfStats() {
+        runCatching { shelfStats = library.shelfStats().mapValues { it.value.impressions to it.value.clicks } }
+    }
+
+    /**
+     * Home shelf order for this visit, from the bandit. Fixed once drawn (so the page doesn't shuffle
+     * while you look at it); shelves that appear later (infinite scroll) are ranked among themselves
+     * and added at the end.
+     */
+    fun orderShelves(keys: List<String>): List<String> {
+        val fresh = keys.filter { it !in shelfOrder }
+        if (fresh.isNotEmpty()) shelfOrder = shelfOrder + bandit.order(fresh, shelfStats)
+        return shelfOrder.filter { it in keys }
+    }
+
+    /** Counts each shelf once per Home visit. */
+    fun noteShelfImpressions(keys: List<String>) {
+        val new = keys.filter { shelfImpressions.add(it) }
+        if (new.isNotEmpty()) scope.launch { runCatching { library.recordShelfImpressions(new) } }
+    }
+
+    fun noteShelfClick(key: String) { scope.launch { runCatching { library.recordShelfClick(key) } } }
+
     // ---------------- search ----------------
 
     fun search(q: String = query) {
         query = q
         if (q.isBlank()) return
-        section = Section.SEARCH
+        navigate(Route.Search)
         searching = true; searchError = null
         scope.launch {
             runCatching { library.rememberSearch(q) }
             YouTube.search(q, YouTube.SearchFilter.FILTER_SONG)
                 .onSuccess { r -> results = r.items.filterIsInstance<SongItem>() }
-                .onFailure { searchError = it.message ?: "Search failed" }
+                .onFailure { searchError = friendlyError(it) }
             searching = false
         }
     }
 
     // ---------------- library ----------------
 
-    fun toggleLike(song: SongItem) { scope.launch { library.toggleLike(song) } }
+    fun toggleLike(song: SongItem) {
+        scope.launch {
+            library.toggleLike(song)
+            if (tasteMixesMissing()) refreshMixes() // the first likes are enough to start Discover Weekly
+        }
+    }
 
     fun addToPlaylist(playlistId: String, song: SongItem) {
         scope.launch { showToast(if (library.addToPlaylist(playlistId, song)) "Added to playlist" else "Already in that playlist") }
@@ -393,13 +984,25 @@ class Controller(
         scope.launch {
             importUi = runCatching { library.importAndroid(file) }
                 .fold({ ImportUi.Done(it) }, { ImportUi.Failed(it.message ?: it.toString()) })
+            if (importUi is ImportUi.Done) { // imported likes, playlists and plays change taste a lot
+                recommender.invalidateEmpty()
+                refreshMixes(force = true)
+            }
         }
     }
 
-    fun showToast(text: String) {
+    fun showToast(text: String, action: ToastAction? = null) {
         toast = text
+        toastAction = action
         toastJob?.cancel()
-        toastJob = scope.launch { delay(2400); toast = null }
+        toastJob = scope.launch { delay(if (action != null) 5000 else 2400); toast = null; toastAction = null }
+    }
+
+    /** The toast's button was clicked. */
+    fun runToastAction() {
+        val action = toastAction ?: return
+        toast = null; toastAction = null; toastJob?.cancel()
+        action.run()
     }
 
     // ---------------- lifecycle ----------------
@@ -411,13 +1014,20 @@ class Controller(
             loadHome() // the feed no longer waits for the stream resolver warm-up
             delay(4_000) // keep the first seconds light; this only shortens the first song's start
             InnerTubeXStream.prewarm()
+            refreshMixes()
         }
     }
 
     /** Saves the last listen and settings; called when the window closes. */
     fun shutdown() {
         val song = playingSong; val ms = playedMax
-        if (song != null && ms >= 10_000) runBlocking { runCatching { library.recordPlay(song, ms) } }
+        val duration = playback.durationMs.takeIf { it > 0 } ?: ((song?.duration ?: 0) * 1000L)
+        if (song != null) runBlocking {
+            runCatching {
+                if (ms >= 10_000) library.recordPlay(song, ms)
+                if (ms > 0) library.recordSignal(song, ms, duration, playStartReason, EndReason.CLOSED, playContext)
+            }
+        }
         saveSettings()
     }
 
@@ -429,6 +1039,13 @@ class Controller(
             p.getProperty("autoplay")?.let { autoplay = it.toBoolean() }
             p.getProperty("panelOpen")?.let { panelOpen = it.toBoolean() }
             p.getProperty("repeat")?.let { r -> RepeatMode.entries.firstOrNull { it.name == r }?.let { queue = queue.copy(repeat = it) } }
+            p.getProperty("panelTab")?.let { t -> PanelTab.entries.firstOrNull { it.name == t }?.let { panelTab = it } }
+            p.getProperty("sidebarWidth")?.toFloatOrNull()?.let { sidebarWidth = it.coerceIn(SIDEBAR_MIN, SIDEBAR_MAX) }
+            p.getProperty("sidebarCollapsed")?.let { sidebarCollapsed = it.toBoolean() }
+            p.getProperty("tastePromptDismissed")?.let { tastePromptDismissed = it.toBoolean() }
+            p.stringPropertyNames().filter { it.startsWith("shuffle.") }.forEach { k ->
+                ShuffleMode.entries.firstOrNull { it.name == p.getProperty(k) }?.let { shuffleModes[k.removePrefix("shuffle.")] = it }
+            }
         }
     }
 
@@ -439,6 +1056,10 @@ class Controller(
             Properties().apply {
                 setProperty("volume", volume.toString()); setProperty("autoplay", autoplay.toString())
                 setProperty("panelOpen", panelOpen.toString()); setProperty("repeat", queue.repeat.name)
+                setProperty("panelTab", panelTab.name)
+                setProperty("sidebarWidth", sidebarWidth.toString()); setProperty("sidebarCollapsed", sidebarCollapsed.toString())
+                setProperty("tastePromptDismissed", tastePromptDismissed.toString())
+                shuffleModes.entries.take(200).forEach { (ctx, mode) -> setProperty("shuffle.$ctx", mode.name) }
             }.let { p -> f.outputStream().use { p.store(it, "W's MUSIC settings") } }
         }
     }

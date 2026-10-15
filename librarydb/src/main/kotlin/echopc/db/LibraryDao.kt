@@ -158,6 +158,111 @@ abstract class LibraryDao {
     @Query("DELETE FROM search_history")
     abstract suspend fun clearSearchHistory()
 
+    // ---- recommendation engine (schema v2) ----
+
+    @Insert
+    abstract suspend fun insert(signal: ListenSignal): Long
+
+    @Query("SELECT * FROM listen_signal WHERE timestamp >= :since ORDER BY timestamp, id")
+    abstract suspend fun signalsSince(since: LocalDateTime): List<ListenSignal>
+
+    /**
+     * Turns history rows (`event`: imported from the Android app, or logged by older versions) into taste
+     * signals. A row already represented by a live signal for the same song within a minute is skipped, so
+     * this is safe to run repeatedly. Plays have no skip information here, so they are "import" plays.
+     */
+    @Query(
+        """
+        INSERT INTO listen_signal (songId, artistKey, artistName, timestamp, playedMs, durationMs, startReason, endReason, context)
+        SELECT e.songId,
+          COALESCE((SELECT CASE WHEN a.id = '' OR substr(a.id, 1, 2) = 'LA' THEN 'name:' || lower(trim(a.name)) ELSE a.id END
+                    FROM song_artist_map m JOIN artist a ON a.id = m.artistId WHERE m.songId = e.songId ORDER BY m.position LIMIT 1), 'name:unknown'),
+          COALESCE((SELECT a.name FROM song_artist_map m JOIN artist a ON a.id = m.artistId WHERE m.songId = e.songId ORDER BY m.position LIMIT 1), ''),
+          e.timestamp, e.playTime, CASE WHEN s.duration > 0 THEN s.duration * 1000 ELSE 0 END, 'import', 'import', 'history'
+        FROM event e JOIN song s ON s.id = e.songId
+        WHERE NOT EXISTS (SELECT 1 FROM listen_signal l WHERE l.songId = e.songId AND l.timestamp BETWEEN e.timestamp - 60000 AND e.timestamp + 60000)
+        """,
+    )
+    abstract suspend fun backfillSignalsFromHistory()
+
+    @Query("SELECT COUNT(*) FROM listen_signal WHERE timestamp > :since")
+    abstract suspend fun countSignalsAfter(since: LocalDateTime): Int
+
+    @Transaction
+    @Query("SELECT * FROM song WHERE id IN (:ids)")
+    abstract suspend fun songs(ids: List<String>): List<Song>
+
+    @Query("SELECT DISTINCT songId FROM playlist_song_map")
+    abstract suspend fun songIdsInPlaylists(): List<String>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun insert(feedback: Feedback)
+
+    @Query("DELETE FROM feedback WHERE targetId = :targetId AND kind = :kind AND context = :context")
+    abstract suspend fun deleteFeedback(targetId: String, kind: String, context: String)
+
+    @Query("SELECT * FROM feedback")
+    abstract fun feedback(): Flow<List<Feedback>>
+
+    @Query("SELECT * FROM feedback")
+    abstract suspend fun feedbackNow(): List<Feedback>
+
+    @Query("SELECT * FROM generated_mix ORDER BY position")
+    abstract fun mixes(): Flow<List<GeneratedMix>>
+
+    @Query("SELECT * FROM generated_mix ORDER BY position")
+    abstract suspend fun mixesNow(): List<GeneratedMix>
+
+    @Query("SELECT * FROM generated_mix WHERE id = :id")
+    abstract fun mix(id: String): Flow<GeneratedMix?>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun upsert(mix: GeneratedMix)
+
+    @Query("DELETE FROM generated_mix WHERE kind = :kind AND id NOT IN (:keep)")
+    abstract suspend fun deleteMixesExcept(kind: String, keep: List<String>)
+
+    @Query("SELECT * FROM related_cache WHERE seedId = :seedId")
+    abstract suspend fun related(seedId: String): RelatedCache?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun upsert(related: RelatedCache)
+
+    @Query("DELETE FROM related_cache WHERE fetchedAt < :before")
+    abstract suspend fun pruneRelated(before: LocalDateTime)
+
+    @Query("SELECT * FROM shelf_stat")
+    abstract suspend fun shelfStats(): List<ShelfStat>
+
+    @Query("INSERT OR IGNORE INTO shelf_stat (shelfKey, impressions, clicks) VALUES (:key, 0, 0)")
+    abstract suspend fun ensureShelf(key: String)
+
+    @Query("UPDATE shelf_stat SET impressions = impressions + 1 WHERE shelfKey IN (:keys)")
+    abstract suspend fun addImpressions(keys: List<String>)
+
+    @Query("UPDATE shelf_stat SET clicks = clicks + 1 WHERE shelfKey = :key")
+    abstract suspend fun addClick(key: String)
+
+    // ---- taste picks ----
+
+    @Query("SELECT * FROM taste_pick ORDER BY pickedAt, artistKey")
+    abstract fun tastePicks(): Flow<List<TastePick>>
+
+    @Query("SELECT * FROM taste_pick ORDER BY pickedAt, artistKey")
+    abstract suspend fun tastePicksNow(): List<TastePick>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun insertAll(picks: List<TastePick>)
+
+    @Query("DELETE FROM taste_pick")
+    abstract suspend fun clearTastePicks()
+
+    @Transaction
+    open suspend fun replaceTastePicks(picks: List<TastePick>) {
+        clearTastePicks()
+        insertAll(picks)
+    }
+
     // ---- lyrics cache ----
 
     @Query("SELECT * FROM lyrics WHERE id = :id")

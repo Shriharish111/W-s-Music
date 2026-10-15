@@ -1,7 +1,5 @@
 package echopc
 
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
@@ -9,8 +7,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.compositionLocalOf
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.platform.Font
 import androidx.compose.ui.text.font.FontFamily
@@ -18,77 +16,86 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import java.io.File
 
-/** W's MUSIC design tokens: near-black surfaces, cool-grey text, one animated neon accent. */
+/**
+ * W's MUSIC design tokens: a neutral black/grey layout (three panels on a black window) with one
+ * accent that is taken from the current album art. Nothing else in the UI is coloured.
+ */
 object Ws {
-    val bg0 = Color(0xFF06060B)
-    val bg1 = Color(0xFF0B0B13)
-    val surface = Color(0xFF11111C)
-    val surfaceHi = Color(0xFF191926)
-    val surfaceTop = Color(0xFF212133)
-    val border = Color(0xFF26263A)
-    val text = Color(0xFFEEEEF8)
-    val muted = Color(0xFF9494B0)
-    val faint = Color(0xFF5A5A75)
-    val danger = Color(0xFFFF5470)
+    val bg0 = Color(0xFF000000) // window, gaps between panels, player bar
+    val surface = Color(0xFF121212) // panels
+    val surfaceHi = Color(0xFF1F1F1F) // cards and rows on hover, inputs
+    val surfaceTop = Color(0xFF2A2A2A) // menus, pressed, chips
+    val border = Color(0xFF333333)
+    val text = Color(0xFFFFFFFF)
+    val muted = Color(0xFFB3B3B3)
+    val faint = Color(0xFF7A7A7A)
+    val danger = Color(0xFFF3727F)
 
     val defaultAccent = Color(0xFF8B5CF6) // violet
-    val defaultAccent2 = Color(0xFF22D3EE) // cyan
+    val defaultAccent2 = Color(0xFF6D3FE0)
 }
 
 @Immutable
 class Accent(val primary: Color, val secondary: Color) {
-    /** Lighter tint of the primary for text and icons (the raw colour can be harsh on dark UIs). */
+    /** Lighter tint of the primary for text and icons on dark surfaces. */
     val highlight: Color get() = androidx.compose.ui.graphics.lerp(primary, Color.White, 0.28f)
+
+    /** Text/icon colour on top of [primary]: album art can be anything from pale yellow to navy. */
+    val onPrimary: Color get() = if (primary.luminance() > 0.45f) Color.Black else Color.White
+
+    /** Darkened primary used to flood large areas (headers, Now Playing, lyrics) without glare. */
+    val flood: Color get() = androidx.compose.ui.graphics.lerp(primary, Color.Black, 0.45f)
 }
 
 val LocalAccent = compositionLocalOf { Accent(Ws.defaultAccent, Ws.defaultAccent2) }
 
-/** Bahnschrift ships with Windows 10/11 (1709+): a clean, technical, slightly condensed face. */
-val UiFont: FontFamily = run {
+/** Figtree (OFL, bundled in resources/fonts). Falls back to the system face if the files are missing. */
+val UiFont: FontFamily = runCatching {
+    FontFamily(
+        Font("fonts/Figtree-Regular.ttf", FontWeight.Normal),
+        Font("fonts/Figtree-Medium.ttf", FontWeight.Medium),
+        Font("fonts/Figtree-SemiBold.ttf", FontWeight.SemiBold),
+        Font("fonts/Figtree-Bold.ttf", FontWeight.Bold),
+        Font("fonts/Figtree-ExtraBold.ttf", FontWeight.ExtraBold),
+    )
+}.getOrDefault(FontFamily.Default)
+
+/** Bahnschrift (ships with Windows 10/11) is kept only for the "W" brand mark. */
+val BrandFont: FontFamily = run {
     val file = File(System.getenv("WINDIR") ?: "C:\\Windows", "Fonts\\bahnschrift.ttf")
-    if (file.isFile) {
-        runCatching {
-            FontFamily(
-                Font(file, FontWeight.Normal),
-                Font(file, FontWeight.Medium),
-                Font(file, FontWeight.SemiBold),
-                Font(file, FontWeight.Bold),
-            )
-        }.getOrDefault(FontFamily.Default)
-    } else FontFamily.Default
+    if (file.isFile) runCatching { FontFamily(Font(file, FontWeight.Bold)) }.getOrDefault(UiFont) else UiFont
 }
 
-private fun t(size: Int, weight: FontWeight = FontWeight.Normal, spacing: Float = 0f, lineHeight: Int = (size * 1.3f).toInt()) =
-    TextStyle(fontFamily = UiFont, fontSize = size.sp, fontWeight = weight, letterSpacing = spacing.sp, lineHeight = lineHeight.sp)
+private fun t(size: Int, weight: FontWeight = FontWeight.Normal, spacing: Float = 0f, lineHeight: Float = 1.35f) =
+    TextStyle(fontFamily = UiFont, fontSize = size.sp, fontWeight = weight, letterSpacing = spacing.sp, lineHeight = (size * lineHeight).sp)
 
+// Scale: 11 · 12 · 13 · 14 · 16 · 20 · 24 · 32 · 72. Large titles are tight (negative tracking), small text is plain.
 private val WsTypography = Typography(
-    displayLarge = t(44, FontWeight.Bold, 1f),
-    headlineLarge = t(30, FontWeight.Bold, 1.5f),
-    headlineMedium = t(24, FontWeight.Bold, 1f),
-    titleLarge = t(20, FontWeight.SemiBold, 0.5f),
-    titleMedium = t(16, FontWeight.SemiBold, 0.2f),
-    titleSmall = t(14, FontWeight.SemiBold, 0.2f),
-    bodyLarge = t(15),
-    bodyMedium = t(13),
-    bodySmall = t(12),
-    labelLarge = t(13, FontWeight.SemiBold, 0.8f),
-    labelMedium = t(11, FontWeight.SemiBold, 1.4f),
-    labelSmall = t(10, FontWeight.Medium, 1.2f),
+    displayLarge = t(72, FontWeight.ExtraBold, -2f, 1.05f),
+    displayMedium = t(48, FontWeight.ExtraBold, -1.2f, 1.08f),
+    displaySmall = t(36, FontWeight.ExtraBold, -0.8f, 1.1f),
+    headlineLarge = t(32, FontWeight.Bold, -0.6f, 1.15f),
+    headlineMedium = t(24, FontWeight.Bold, -0.3f, 1.2f),
+    titleLarge = t(20, FontWeight.Bold, -0.1f),
+    titleMedium = t(16, FontWeight.SemiBold),
+    titleSmall = t(14, FontWeight.SemiBold),
+    bodyLarge = t(16),
+    bodyMedium = t(14),
+    bodySmall = t(13),
+    labelLarge = t(14, FontWeight.Bold),
+    labelMedium = t(12, FontWeight.SemiBold),
+    labelSmall = t(11, FontWeight.Medium),
 )
 
 @Composable
 fun WsTheme(accent: Accent, content: @Composable () -> Unit) {
-    // Cross-fade the accent when the song (and so the album art) changes.
     // The accent switches instantly with the song; animating it recomposed the whole window for ~40 frames.
-    val primary = accent.primary
-    val secondary = accent.secondary
-    val animated = accent
     val scheme = darkColorScheme(
-        primary = primary,
-        onPrimary = Color.White,
-        primaryContainer = primary.copy(alpha = 0.22f),
+        primary = accent.primary,
+        onPrimary = accent.onPrimary,
+        primaryContainer = accent.primary.copy(alpha = 0.22f),
         onPrimaryContainer = Ws.text,
-        secondary = secondary,
+        secondary = accent.secondary,
         background = Ws.bg0,
         onBackground = Ws.text,
         surface = Ws.surface,
@@ -98,9 +105,7 @@ fun WsTheme(accent: Accent, content: @Composable () -> Unit) {
         outline = Ws.border,
         error = Ws.danger,
     )
-    CompositionLocalProvider(LocalAccent provides animated) {
+    CompositionLocalProvider(LocalAccent provides accent) {
         MaterialTheme(colorScheme = scheme, typography = WsTypography, content = content)
     }
 }
-
-

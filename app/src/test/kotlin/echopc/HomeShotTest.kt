@@ -26,7 +26,8 @@ class HomeShotTest {
     @Test
     fun renderHome() = runDesktopComposeUiTest(width = 1340, height = 1700, testTimeout = 6.minutes) {
         val repo = LibraryRepository(LibraryDatabase.open(File.createTempFile("ws-home", ".db").also { it.delete(); it.deleteOnExit() }))
-        val c = Controller(CoroutineScope(SupervisorJob() + Dispatchers.Default), repo, null) { _, _ -> FakeEngine() }
+        val scope = TestScope()
+        val c = Controller(scope, repo, null) { _, _ -> FakeEngine() }
         runBlocking {
             YouTube.visitorData().onSuccess { YouTube.visitorData = it }
             val songs = YouTube.search("synthwave gaming", YouTube.SearchFilter.FILTER_SONG).getOrThrow().items.filterIsInstance<SongItem>().take(8)
@@ -34,6 +35,9 @@ class HomeShotTest {
             val p = repo.createPlaylist("Late night drive"); songs.take(3).forEach { repo.addToPlaylist(p.id, it) }
             repo.createPlaylist("Gym grind")
             songs.take(5).forEachIndexed { i, s -> repo.recordPlay(s, 60_000L + i) }
+            // Listening signals, then a real recommender run, so "Made for you" shows generated mixes.
+            songs.forEachIndexed { i, s -> repeat(3 - i % 3) { repo.recordSignal(s, 200_000, 200_000, echopc.db.StartReason.CLICK_ROW, echopc.db.EndReason.TRACK_DONE, "search") } }
+            c.recommender.refresh(force = true)
         }
         // Real feed data, loaded through the same controller code the app uses.
         c.loadHome()
@@ -52,13 +56,22 @@ class HomeShotTest {
         }
         shot("h1-home")
 
+        // A generated mix page.
+        val t2 = System.currentTimeMillis()
+        while (c.mixes.isEmpty() && System.currentTimeMillis() - t2 < 10_000) Thread.sleep(200)
+        println("MIXES: ${c.mixes.map { "${it.title} (${c.mixSongs(it).size})" }}")
+        c.mixes.firstOrNull { it.kind == echopc.reco.MixKind.DAILY }?.let { c.navigate(Route.Mix(it.id)); shot("h3-mix") }
+        c.goHome()
+
         // Playlist detail page with real songs.
         val playlist = c.homeSections.flatMap { it.items }.filterIsInstance<PlaylistItem>().first()
         c.openPlaylist(playlist)
         val t1 = System.currentTimeMillis()
-        while (c.detail !is DetailUi.Songs && System.currentTimeMillis() - t1 < 40_000) Thread.sleep(200)
-        println("DETAIL: ${(c.detail as? DetailUi.Songs)?.let { "${it.title} / ${it.songs.size} songs" } ?: c.detail}")
+        fun detail() = (c.route as? Route.Online)?.let { c.details[it.key] }
+        while (detail() !is DetailUi.Songs && System.currentTimeMillis() - t1 < 40_000) Thread.sleep(200)
+        println("DETAIL: ${(detail() as? DetailUi.Songs)?.let { "${it.title} / ${it.songs.size} songs" } ?: detail()}")
         shot("h2-detail")
+        scope.stop()
         repo.close()
     }
 }

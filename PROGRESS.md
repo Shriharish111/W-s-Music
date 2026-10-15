@@ -11,6 +11,47 @@ Last updated: 2026-10-15. This file lets anyone (or another Claude session / acc
 - Local data in `%APPDATA%\WsMusic` (Room/SQLite). Settings: volume, autoplay, repeat, panel.
 - Packaged for friends as a standalone Windows folder (`gradlew :app:createDistributable`).
 
+## Spotify-style redesign (branch `spotify-redesign`, 2026-10-15)
+Plan: `D:\WMUSIC\PLAN.md`; client research notes: `D:\WMUSIC\_research\SPOTIFY_NOTES.md`.
+- **Phase 2 UI (done):** three-panel shell (`Shell.kt`, `LibrarySidebar.kt`, `NowPlayingView.kt`, `PlayerBar.kt`),
+  shared collection pages / track table (`Tracks.kt`), back/forward `Route` stack in `Controller`, Figtree font.
+- **Phase 3 engine (done):** DB schema v2 (`MIGRATION_1_2` in `LibraryDatabase.kt`) adds `listen_signal`, `feedback`,
+  `generated_mix`, `related_cache`, `shelf_stat`. Every play logs start/end reason + ms played (`Controller.flushPlay`).
+  `reco/`: `TasteProfile` (7/180-day decay, skips negative, likes +3), `MixEngine` (Daily Mix clusters via label
+  propagation, Discover Weekly co-occurrence, Release Radar, On Repeat, Repeat Rewind), `ShelfBandit` (Thompson
+  sampling for Home shelf order), `Recommender` (schedule: daily / Monday / Friday, cached YouTube radio).
+  Smoke: `gradlew :app:smoke -Pmain=echopc.RecoSmokeKt` builds real mixes in a temp DB (~25 s).
+- **Phase 4 (done):** per-playlist shuffle mode OFF -> ON -> SMART (`Controller.cycleShuffle`, saved in settings).
+  Smart Shuffle = shuffle + one recommendation after every 3 songs (`QueueState.withSmartShuffle`,
+  `Recommender.smartShuffle`: co-occurrence over a sample of the page's songs, cached per page per day); queue rows
+  show a sparkle with Remove (hides it for that page) and, in your own playlists, Add to playlist.
+  Song menu: Not interested, Hide from this playlist/mix/album, Don't play <artist>, Exclude from your taste profile
+  (each reversible; toast Undo). Hidden / blocked songs are dimmed and skipped by `startCurrent`.
+- **Cold start / small libraries (done):** fewer than 6 known songs -> the library is one taste, a single Daily Mix
+  needing 2 familiar songs (`MixEngine.dailyMixes`); Smart Shuffle uses `min(3, upcoming)` as its step so short lists get
+  a recommendation (an empty fetch is no longer cached for the day); an empty mix build is retried the same day after
+  5 plays or a changed like count (`Recommender.isStale`; `Controller.onSignalRecorded` triggers at 5 while Daily/Discover
+  are missing, else 20); history rows (Android import, pre-signal plays) are turned into `import` signals by
+  `LibraryDao.backfillSignalsFromHistory` at the start of every mix build; an import also forces a rebuild.
+  Taste only looks back 365 days, so very old imported plays don't count.
+- **Keyboard, tooltips, right-click (done):** `Shortcuts.kt` is the single table of shortcuts (Space, Ctrl+Left/Right,
+  Shift+Left/Right seek, Ctrl+Up/Down volume, M, Ctrl+S, Ctrl+R, Alt+Shift+B like, Ctrl+L, Alt+Left/Right, Ctrl+/ help);
+  `ShortcutHandler` is wired in `Main.kt` and stands down while a text box has focus. `WsTooltip` (Widgets.kt) gives every
+  icon button a hover label with its shortcut (above the button in the player bar, below elsewhere) and `Role.Button`;
+  `HoverRow(menu = ...)` opens `SongMenuItems` at the pointer on right-click (song rows and queue rows).
+  No auto-update: the app is a manually distributed Compose Desktop build (only the YouTube cipher config is fetched live).
+- **New users (done):** schema v3 adds `taste_pick` (`MIGRATION_2_3`). Home shows a "Tell us what you like" card (`TastePromptCard`)
+  and a labelled "Popular right now" shelf while there are no mixes; the picker is `TastePicker.kt` (`Route.Picker`).
+  Picks seed taste (`TasteProfile.build(pickSongs=...)`, `Weights.PICK_SONG`; top songs from `CandidateSource.topSongs`, cached
+  30 days) and force a mix rebuild. `Discovery.kt`: YouTube's charts page is EMPTY for anonymous visitors, so popular songs come
+  from YouTube Music's "The Hit List" playlist and picker artists from the artists on its hit playlists (photos via artist search);
+  cached 1 day / 7 days, with the last saved copy used when offline. Smoke: `gradlew :app:smoke -Pmain=echopc.PickerSmokeKt`.
+- **Home is never blank:** skeleton placeholders until something arrives; the feed retries itself (15 s, 30 s, 60 s, 2 min);
+  errors go through `friendlyError` (never raw server JSON); the popular songs load is started by `Controller` (not by a Compose
+  effect, which a background state write may not trigger) and retried 3 times. Not cached offline: the YouTube feed shelves.
+  Test hygiene: tests must cancel+join their Controller scope (`TestScope.stop()`) before closing the DB, else the
+  native SQLite crashes the test JVM; `Main.kt` does the same on window close.
+
 ## Stream playback (important background)
 YouTube refuses anonymous stream URLs for most clients. What works today: InnerTubeX (`innertubex` 0.7.2)
 with **SABR** audio (`allowSabr = true`) via `InnerTubeXStream.kt` + `downloadSabrAudio`; the whole AAC file is

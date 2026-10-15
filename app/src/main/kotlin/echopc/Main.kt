@@ -54,6 +54,7 @@ fun main() = application {
         LyricsRepository.store = library
         Controller(scope, library, if (bench) null else settingsFile()) { onState, onEnded -> DesktopPlayer(onState, onEnded) }.also { Trace.mark("controller created") }
     }
+    val shortcuts = remember { ShortcutHandler(controller) }
     val icon = remember { BitmapPainter(renderAppIcon(256).toComposeImageBitmap()) }
     // Fit the window to the usable screen (minus taskbar) so small laptop displays are not overrun.
     val usable = remember { java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment().maximumWindowBounds }
@@ -63,22 +64,16 @@ fun main() = application {
     Window(
         onCloseRequest = {
             controller.shutdown()
+            // Flow collectors keep querying; stop them before the database closes.
+            val job = scope.coroutineContext[kotlinx.coroutines.Job]
+            kotlinx.coroutines.runBlocking { job?.cancel(); job?.join() }
             library.close()
             exitApplication()
         },
         title = APP_NAME,
         icon = icon,
         state = rememberWindowState(size = DpSize(startW.dp, startH.dp), position = androidx.compose.ui.window.WindowPosition.Aligned(androidx.compose.ui.Alignment.Center)),
-        onPreviewKeyEvent = { e ->
-            // Space = play/pause, Ctrl+Left/Right = previous/next (unless a text field is being typed in).
-            if (e.type != KeyEventType.KeyDown || controller.typing) false
-            else when {
-                e.key == Key.Spacebar -> { controller.togglePause(); true }
-                e.isCtrlPressed && e.key == Key.DirectionRight -> { controller.skipNext(); true }
-                e.isCtrlPressed && e.key == Key.DirectionLeft -> { controller.skipPrevious(); true }
-                else -> false
-            }
-        },
+        onPreviewKeyEvent = shortcuts::onKeyEvent, // see Shortcuts.kt
     ) {
         Trace.mark("window content started")
         window.minimumSize = Dimension(minOf(960, startW), minOf(560, startH))

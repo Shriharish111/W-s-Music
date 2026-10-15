@@ -32,52 +32,59 @@ class UiFlowTest {
     fun wholeLibraryFlow() = runDesktopComposeUiTest(width = 1340, height = 840, testTimeout = 4.minutes) {
         val repo = LibraryRepository(LibraryDatabase.open(tmp(".db")))
         val engine = FakeEngine()
-        val c = Controller(CoroutineScope(SupervisorJob() + Dispatchers.Default), repo, null) { _, _ -> engine }
+        val scope = TestScope()
+        val c = Controller(scope, repo, null) { _, _ -> engine }
         val songs = listOf(fakeSong(1, "Alpha Track", "Artist A"), fakeSong(2, "Beta Track", "Artist B"), fakeSong(3, "Gamma Track", "Artist C"))
         c.results = songs
-        c.section = Section.SEARCH // the app opens on Home now
+        c.navigate(Route.Search) // the app opens on Home
         setContent { WsTheme(c.accent) { AppContent(c, onPickAndroidFile = {}) } }
 
-        // 1. Heart the first result.
+        // 1. Heart a result (the heart is in every row, revealed on hover, always keyboard reachable).
+        waitUntil(timeoutMillis = 8_000L) { onAllNodesWithContentDescription("Like").fetchSemanticsNodes().isNotEmpty() }
         onAllNodesWithContentDescription("Like")[0].performClick()
         waitUntil(timeoutMillis = 8_000L) { runBlocking { repo.likedSongs.first().size } == 1 }
-        waitUntil(timeoutMillis = 8_000L) { c.likedIds == setOf("fake1") }
+        waitUntil(timeoutMillis = 8_000L) { c.likedIds.size == 1 }
+        val likedId = c.likedIds.single()
+        val likedTitle = songs.first { it.id == likedId }.title
 
         // 2. Clicking a result starts playback of that song and queues the list.
-        onNodeWithText("Beta Track").performClick()
+        onAllNodesWithText("Beta Track")[0].performClick()
         waitUntil(timeoutMillis = 5_000L) { engine.played.isNotEmpty() }
         assertEquals("fake2", c.queue.current?.id)
         assertEquals(3, c.queue.items.size)
         assertEquals("fake2", engine.played.last())
 
-        // 3. Library tab shows the liked song.
-        onNodeWithText("LIBRARY").performClick()
-        waitUntil(timeoutMillis = 8_000L) { onAllNodesWithText("YOUR LIBRARY").fetchSemanticsNodes().isNotEmpty() }
-        waitUntil(timeoutMillis = 8_000L) { onAllNodesWithText("Alpha Track").fetchSemanticsNodes().isNotEmpty() }
+        // 3. Liked Songs in the library sidebar opens the page with the liked song.
+        onAllNodesWithText("Liked Songs")[0].performClick()
+        waitUntil(timeoutMillis = 5_000L) { c.route == Route.Liked }
+        waitUntil(timeoutMillis = 8_000L) { onAllNodesWithText(likedTitle).fetchSemanticsNodes().isNotEmpty() }
 
-        // 4. New playlist through the dialog.
-        onNodeWithText("PLAYLISTS").performClick()
-        waitUntil(timeoutMillis = 5_000L) { onAllNodesWithText("NEW PLAYLIST").fetchSemanticsNodes().isNotEmpty() }
-        onAllNodesWithText("NEW PLAYLIST")[0].performClick()
+        // 4. New playlist through the sidebar's + button and the dialog.
+        onNodeWithContentDescription("Create playlist").performClick()
         waitUntil(timeoutMillis = 5_000L) { c.newPlaylistOpen && onAllNodesWithText("Name").fetchSemanticsNodes().isNotEmpty() }
         onNodeWithText("Name").performTextInput("Boss fight")
-        onNodeWithText("CREATE").performClick()
+        onNodeWithText("Create").performClick()
         waitUntil(timeoutMillis = 8_000L) { runBlocking { repo.playlists.first().any { it.playlist.name == "Boss fight" } } }
         waitUntil(timeoutMillis = 5_000L) { !c.newPlaylistOpen }
+        waitUntil(timeoutMillis = 8_000L) { onAllNodesWithText("Boss fight").fetchSemanticsNodes().isNotEmpty() } // listed in the sidebar
 
         // 5. Import from an Android database through the real dialogs.
         val android = tmp(".db").also(::buildAndroidDb)
         c.importAndroid(android)
-        waitUntil(timeoutMillis = 15_000L) { onAllNodesWithText("IMPORT COMPLETE").fetchSemanticsNodes().isNotEmpty() }
+        waitUntil(timeoutMillis = 15_000L) { onAllNodesWithText("Import complete").fetchSemanticsNodes().isNotEmpty() }
         assertTrue(c.importUi is ImportUi.Done)
-        onNodeWithText("DONE").performClick()
+        onNodeWithText("Done").performClick()
         waitUntil(timeoutMillis = 5_000L) { c.importUi == ImportUi.Idle }
         val liked = runBlocking { repo.likedSongs.first().map { it.song.id }.toSet() }
-        assertTrue(liked.containsAll(setOf("fake1", "s1", "s2", "s8")), "liked=$liked")
+        assertTrue(liked.containsAll(setOf(likedId, "s1", "s2", "s8")), "liked=$liked")
         val names = runBlocking { repo.playlists.first().map { it.playlist.name }.toSet() }
         assertTrue(names.containsAll(setOf("Boss fight", "Gym", "Synced from YouTube")), "playlists=$names")
-        // The visible Playlists tab refreshes by itself after the import.
+        // The sidebar refreshes by itself after the import.
         waitUntil(timeoutMillis = 8_000L) { onAllNodesWithText("Gym", substring = true).fetchSemanticsNodes().isNotEmpty() }
+
+        // Back / forward through the pages visited.
+        c.goBack(); assertEquals(Route.Search, c.route)
+        c.goForward(); assertEquals(Route.Liked, c.route)
 
         // 6. Queue controls.
         c.skipNext()
@@ -85,6 +92,7 @@ class UiFlowTest {
         c.skipPrevious()
         assertEquals("fake2", c.queue.current?.id)
         c.cycleRepeat(); assertEquals(RepeatMode.ALL, c.queue.repeat)
+        scope.stop()
         repo.close()
     }
 
@@ -92,7 +100,8 @@ class UiFlowTest {
     fun homePage() = runDesktopComposeUiTest(width = 1340, height = 1700, testTimeout = 4.minutes) {
         val repo = LibraryRepository(LibraryDatabase.open(tmp(".db")))
         val engine = FakeEngine()
-        val c = Controller(CoroutineScope(SupervisorJob() + Dispatchers.Default), repo, null) { _, _ -> engine }
+        val scope = TestScope()
+        val c = Controller(scope, repo, null) { _, _ -> engine }
         val songs = listOf(fakeSong(1, "Alpha Track", "Artist A"), fakeSong(2, "Beta Track", "Artist B"))
         val playlist = PlaylistItem("PLx", "Chill Mix", com.music.innertube.models.Artist("Curator", null), "20 songs", null, null, null, null)
         c.homeSections = listOf(HomePage.Section("Fresh picks", "JUST FOR YOU", null, null, songs + playlist))
@@ -101,7 +110,7 @@ class UiFlowTest {
         setContent { WsTheme(c.accent) { AppContent(c, onPickAndroidFile = {}) } }
 
         // Front page: starts on Home with shelf, chips, quick tiles and a mix from listening history.
-        assertEquals(Section.HOME, c.section)
+        assertEquals(Route.Home, c.route)
         waitUntil(conditionDescription = "home wait #1", timeoutMillis = 8_000L) { onAllNodesWithText("Fresh picks").fetchSemanticsNodes().isNotEmpty() }
         onNodeWithText("Party").assertExists(); onNodeWithText("Focus").assertExists()
         waitUntil(conditionDescription = "home wait #2", timeoutMillis = 8_000L) { onAllNodesWithText("Liked Songs", substring = true).fetchSemanticsNodes().isNotEmpty() }
@@ -113,18 +122,19 @@ class UiFlowTest {
         waitUntil(conditionDescription = "home wait #5", timeoutMillis = 5_000L) { engine.played.isNotEmpty() }
         assertTrue(engine.played.last() in setOf("fake1", "fake2"), "played=${engine.played}")
 
-        // Playlist detail page: shows, then Back returns to the feed.
-        c.detail = DetailUi.Songs("Chill Mix", "Playlist", "Curator · 2 songs", null, songs)
-        waitUntil(conditionDescription = "home wait #6", timeoutMillis = 5_000L) { onAllNodesWithText("BACK TO HOME").fetchSemanticsNodes().isNotEmpty() }
-        onNodeWithText("SAVE TO MY PLAYLISTS").performClick()
+        // Playlist page: shows, Save adds it to the library, then Back returns to the feed.
+        c.showDetail("test", DetailUi.Songs("Chill Mix", "Playlist", "Curator • 2 songs", null, songs))
+        waitUntil(conditionDescription = "home wait #6", timeoutMillis = 5_000L) { onAllNodesWithContentDescription("Save to Your Library").fetchSemanticsNodes().isNotEmpty() }
+        onNodeWithContentDescription("Save to Your Library").performClick()
         waitUntil(conditionDescription = "home wait #7", timeoutMillis = 8_000L) { runBlocking { repo.playlists.first().any { it.playlist.name == "Chill Mix" && it.songCount == 2 } } }
-        onNodeWithContentDescription("Back").performClick()
-        waitUntil(conditionDescription = "home wait #8", timeoutMillis = 5_000L) { c.detail == null }
+        onNodeWithContentDescription("Go back").performClick()
+        waitUntil(conditionDescription = "home wait #8", timeoutMillis = 5_000L) { c.route == Route.Home }
         waitUntil(conditionDescription = "home wait #9", timeoutMillis = 8_000L) { onAllNodesWithText("Fresh picks").fetchSemanticsNodes().isNotEmpty() }
 
-        // Quick tile "Liked Songs" jumps to the library.
+        // "Liked Songs" (quick tile or sidebar) opens the Liked Songs page.
         onAllNodesWithText("Liked Songs", substring = true)[0].performClick()
-        waitUntil(conditionDescription = "home wait #10", timeoutMillis = 5_000L) { c.section == Section.LIBRARY }
+        waitUntil(conditionDescription = "home wait #10", timeoutMillis = 5_000L) { c.route == Route.Liked }
+        scope.stop()
         repo.close()
     }
 }
