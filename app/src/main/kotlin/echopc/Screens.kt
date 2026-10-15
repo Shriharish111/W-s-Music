@@ -88,6 +88,7 @@ fun SearchPage(c: Controller) {
     val recent by c.library.searchHistory().collectAsState(emptyList())
     val scope = rememberCoroutineScope()
     when {
+        c.typing && c.query.isNotBlank() && c.query.trim() != c.lastSearched -> SuggestionsView(c) // still typing: show matches
         c.searching && c.results.isEmpty() -> EmptyState("Searching for “${c.query}”", "")
         c.searchError != null -> EmptyState("Search didn't work", "${c.searchError}. Check your connection and try again.") {
             PrimaryButton("Try again", { c.search() }, icon = Icons.Rounded.Refresh)

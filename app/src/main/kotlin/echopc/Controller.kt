@@ -18,6 +18,7 @@ import com.music.innertube.models.YTItem
 import com.music.innertube.pages.BrowseResult
 import com.music.innertube.pages.HomePage
 import com.music.innertube.pages.MoodAndGenres
+import com.music.innertube.models.SearchSuggestions
 import com.music.innertube.pages.SearchSummary
 import echopc.db.ImportResult
 import echopc.db.EndReason
@@ -211,6 +212,13 @@ class Controller(
     private var tabContinuation: String? = null
     private val tabCache = HashMap<SearchTab, Pair<List<YTItem>, String?>>()
     private var searchedQuery = ""
+    /** What the last finished search was for; the typing view shows while the box differs from it. */
+    var lastSearched by mutableStateOf("")
+        private set
+    var suggestions by mutableStateOf<SearchSuggestions?>(null)
+    var suggestionsFor by mutableStateOf("")
+    var suggestionsLoading by mutableStateOf(false)
+    private var suggestJob: Job? = null
     private var searchGeneration = 0
 
     // ---- playback ----
@@ -961,13 +969,29 @@ class Controller(
 
     // ---------------- search ----------------
 
+    /** The search box changed: remember the text and (after a short pause) fetch matches for it. */
+    fun typeQuery(text: String) {
+        query = text
+        val q = text.trim()
+        suggestJob?.cancel()
+        if (q.isEmpty()) { suggestions = null; suggestionsFor = ""; suggestionsLoading = false; return }
+        suggestionsLoading = true
+        suggestJob = scope.launch {
+            delay(200) // wait for a pause in typing
+            YouTube.searchSuggestions(q)
+                .onSuccess { suggestions = it; suggestionsFor = q }
+                .onFailure { Device.log("Suggestions for '$q' failed: ${it.message?.take(120)}") }
+            suggestionsLoading = false
+        }
+    }
+
     fun search(q: String = query) {
         query = q
         if (q.isBlank()) return
         navigate(Route.Search)
         searching = true; searchError = null; searchDone = false
         searchTab = SearchTab.All; tabCache.clear(); tabItems = emptyList(); tabMore = false; tabContinuation = null
-        searchedQuery = q
+        searchedQuery = q; lastSearched = q.trim(); suggestJob?.cancel(); suggestionsLoading = false
         val gen = ++searchGeneration
         scope.launch {
             runCatching { library.rememberSearch(q) }

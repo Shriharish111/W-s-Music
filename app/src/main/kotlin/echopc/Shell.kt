@@ -228,7 +228,7 @@ private fun TopSearch(c: Controller) {
         Box(Modifier.weight(1f)) {
             if (c.query.isEmpty()) Text("What do you want to play?", style = MaterialTheme.typography.bodyLarge, color = Ws.muted, maxLines = 1)
             BasicTextField(
-                c.query, { c.query = it }, singleLine = true,
+                c.query, { c.typeQuery(it) }, singleLine = true,
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = Ws.text),
                 cursorBrush = SolidColor(Ws.text),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
@@ -238,7 +238,7 @@ private fun TopSearch(c: Controller) {
                     .onKeyEvent { if (it.type == KeyEventType.KeyDown && it.key == Key.Enter) { c.search(); true } else false },
             )
         }
-        if (c.query.isNotEmpty()) WsIconButton(Icons.Rounded.Close, "Clear search", { c.query = "" }, size = 32.dp, iconSize = 18.dp)
+        if (c.query.isNotEmpty()) WsIconButton(Icons.Rounded.Close, "Clear search", { c.typeQuery("") }, size = 32.dp, iconSize = 18.dp)
     }
 }
 
