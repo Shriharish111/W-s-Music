@@ -34,13 +34,21 @@ dependencies {
     for (m in listOf("base", "graphics", "media")) implementation("org.openjfx:javafx-$m:$fx:$plat")
 }
 
+// One place for the version: the installer, the Updater (version.properties) and the release tag must agree.
+val appVersion = "1.0.2"
+
+tasks.processResources {
+    inputs.property("appVersion", appVersion)
+    filesMatching("version.properties") { expand("appVersion" to appVersion) }
+}
+
 compose.desktop {
     application {
         mainClass = "echopc.MainKt"
         nativeDistributions {
             targetFormats(TargetFormat.Msi, TargetFormat.Exe)
             packageName = "WsMusic"
-            packageVersion = "1.0.0"
+            packageVersion = appVersion
             includeAllModules = true // keeps TLS (jdk.crypto.ec), java.net.http, sql etc. in the bundled runtime
             description = "W's MUSIC"
             vendor = "W"
@@ -85,6 +93,7 @@ dependencies {
 
 tasks.withType<Test> {
     systemProperty("wsmusic.nolog", "1")
+    forkEvery = 1 // each test class in its own JVM: UI tests share global state (Skiko, caches) and were disturbing each other
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true; exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
 }
 

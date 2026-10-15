@@ -57,7 +57,7 @@ fun PlayerBar(c: Controller) {
                 }
                 val err = c.playback.error
                 when {
-                    err != null -> Text("Couldn't play this song: $err", style = MaterialTheme.typography.bodySmall, color = Ws.danger, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    err != null -> Text("Couldn't play this song: ${playbackErrorText(err)}", style = MaterialTheme.typography.bodySmall, color = Ws.danger, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     song != null -> Text(song.artists.joinToString { it.name }, style = MaterialTheme.typography.bodySmall, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }

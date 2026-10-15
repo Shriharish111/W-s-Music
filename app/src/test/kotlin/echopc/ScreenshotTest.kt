@@ -71,7 +71,7 @@ class ScreenshotTest {
 
         // State as if the user searched and is playing the 2nd song.
         c.results = songs
-        c.query = "synthwave gaming"
+        c.query = "synthwave gaming"; c.lastSearched = "synthwave gaming"
         c.queue = QueueState(items = songs, index = 1)
         c.playback = PlayerState(playing = true, durationMs = 214_000)
         c.positionMs = 83_000
