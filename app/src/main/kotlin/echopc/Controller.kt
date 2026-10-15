@@ -986,7 +986,7 @@ class Controller(
                     .onFailure { failure = it }
             }
             if (gen != searchGeneration) return@launch
-            failure?.let { searchError = friendlyError(it) }
+            failure?.let { Device.log("Search for '$q' failed: ${it.message?.take(200)}"); searchError = friendlyError(it) }
             searching = false; searchDone = true
         }
     }

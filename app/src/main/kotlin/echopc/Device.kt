@@ -46,6 +46,7 @@ object Device {
     private fun save() = runCatching { file.outputStream().use { props.store(it, "W's MUSIC device settings") } }
 
     fun log(message: String) {
+        if (System.getProperty("wsmusic.nolog") != null) return // tests do not write to the real log
         runCatching {
             if (logFile.length() > 512 * 1024) logFile.writeText("")
             logFile.appendText("${java.time.LocalDateTime.now()}  $message\n")
