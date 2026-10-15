@@ -18,6 +18,8 @@ import com.music.innertube.models.YTItem
 import com.music.innertube.pages.BrowseResult
 import com.music.innertube.pages.HomePage
 import com.music.innertube.pages.MoodAndGenres
+import com.music.innertube.models.SearchSuggestions
+import com.music.innertube.pages.SearchSummary
 import echopc.db.ImportResult
 import echopc.db.EndReason
 import echopc.db.Feedback
@@ -41,6 +43,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+
+/** Search result views: "All" is YouTube Music's mixed page, the others are its filtered lists (paged). */
+enum class SearchTab(val label: String) { All("All"), Songs("Songs"), Videos("Videos"), Albums("Albums"), Artists("Artists"), Playlists("Playlists") }
 
 /** A page of the main view. The controller keeps a back stack of these (top bar back/forward). */
 sealed interface Route {
@@ -198,6 +203,23 @@ class Controller(
     var results by mutableStateOf<List<SongItem>>(emptyList())
     var searching by mutableStateOf(false)
     var searchError by mutableStateOf<String?>(null)
+    var searchDone by mutableStateOf(false)            // a search finished (so "no results" can be told apart from "not searched yet")
+    var searchTab by mutableStateOf(SearchTab.All)
+    var searchSummaries by mutableStateOf<List<SearchSummary>>(emptyList()) // the "All" view: top result, songs, videos, albums, artists, playlists
+    var tabItems by mutableStateOf<List<YTItem>>(emptyList())
+    var tabLoading by mutableStateOf(false)
+    var tabMore by mutableStateOf(false)
+    private var tabContinuation: String? = null
+    private val tabCache = HashMap<SearchTab, Pair<List<YTItem>, String?>>()
+    private var searchedQuery = ""
+    /** What the last finished search was for; the typing view shows while the box differs from it. */
+    var lastSearched by mutableStateOf("")
+        private set
+    var suggestions by mutableStateOf<SearchSuggestions?>(null)
+    var suggestionsFor by mutableStateOf("")
+    var suggestionsLoading by mutableStateOf(false)
+    private var suggestJob: Job? = null
+    private var searchGeneration = 0
 
     // ---- playback ----
     var queue by mutableStateOf(QueueState())
@@ -755,6 +777,11 @@ class Controller(
         )
     }
 
+    fun openArtist(a: ArtistItem) = loadDetail("artist:${a.id}", a.title) {
+        val page = YouTube.artist(a.id).getOrThrow()
+        DetailUi.Collection(page.artist.title.ifBlank { a.title }, page.sections.filter { it.items.isNotEmpty() }.map { BrowseResult.Item(it.title, it.items) })
+    }
+
     fun openMood(item: MoodAndGenres.Item) = loadDetail("mood:${item.endpoint.browseId}:${item.endpoint.params}", item.title) {
         val r = YouTube.browse(item.endpoint.browseId, item.endpoint.params).getOrThrow()
         DetailUi.Collection(r.title ?: item.title, r.items.filter { it.items.isNotEmpty() })
@@ -766,7 +793,7 @@ class Controller(
             is PlaylistItem -> openPlaylist(item)
             is AlbumItem -> openAlbum(item)
             is SongItem -> { val songs = siblings.filterIsInstance<SongItem>(); playFromList(songs, songs.indexOfFirst { it.id == item.id }.coerceAtLeast(0)) }
-            is ArtistItem -> search(item.title)
+            is ArtistItem -> openArtist(item)
             else -> Unit
         }
     }
@@ -942,17 +969,100 @@ class Controller(
 
     // ---------------- search ----------------
 
+    /** The search box changed: remember the text and (after a short pause) fetch matches for it. */
+    fun typeQuery(text: String) {
+        query = text
+        val q = text.trim()
+        suggestJob?.cancel()
+        if (q.isEmpty()) { suggestions = null; suggestionsFor = ""; suggestionsLoading = false; return }
+        suggestionsLoading = true
+        suggestJob = scope.launch {
+            delay(200) // wait for a pause in typing
+            YouTube.searchSuggestions(q)
+                .onSuccess { suggestions = it; suggestionsFor = q }
+                .onFailure { Device.log("Suggestions for '$q' failed: ${it.message?.take(120)}") }
+            suggestionsLoading = false
+        }
+    }
+
     fun search(q: String = query) {
         query = q
         if (q.isBlank()) return
         navigate(Route.Search)
-        searching = true; searchError = null
+        searching = true; searchError = null; searchDone = false
+        searchTab = SearchTab.All; tabCache.clear(); tabItems = emptyList(); tabMore = false; tabContinuation = null
+        searchedQuery = q; lastSearched = q.trim(); suggestJob?.cancel(); suggestionsLoading = false
+        val gen = ++searchGeneration
         scope.launch {
             runCatching { library.rememberSearch(q) }
-            YouTube.search(q, YouTube.SearchFilter.FILTER_SONG)
-                .onSuccess { r -> results = r.items.filterIsInstance<SongItem>() }
-                .onFailure { searchError = friendlyError(it) }
-            searching = false
+            var failure: Throwable? = null
+            YouTube.searchSummary(q)
+                .onSuccess { page ->
+                    if (gen != searchGeneration) return@launch
+                    val ranked = SearchRank.apply(q, page.summaries) // the song that was typed first, not a video or cover of it
+                    searchSummaries = ranked.summaries
+                    results = ranked.songs
+                }
+                .onFailure { failure = it }
+            if (failure != null) { // the mixed page failed: fall back to the plain song list so search still works
+                YouTube.search(q, YouTube.SearchFilter.FILTER_SONG)
+                    .onSuccess { r -> if (gen != searchGeneration) return@launch; searchSummaries = emptyList(); results = SearchRank.rank(q, r.items.filterIsInstance<SongItem>()); failure = null }
+                    .onFailure { failure = it }
+            }
+            if (gen != searchGeneration) return@launch
+            failure?.let { Device.log("Search for '$q' failed: ${it.message?.take(200)}"); searchError = friendlyError(it) }
+            searching = false; searchDone = true
+        }
+    }
+
+    private fun filtersFor(tab: SearchTab): List<YouTube.SearchFilter> = when (tab) {
+        SearchTab.Songs -> listOf(YouTube.SearchFilter.FILTER_SONG)
+        SearchTab.Videos -> listOf(YouTube.SearchFilter.FILTER_VIDEO)
+        SearchTab.Albums -> listOf(YouTube.SearchFilter.FILTER_ALBUM)
+        SearchTab.Artists -> listOf(YouTube.SearchFilter.FILTER_ARTIST)
+        SearchTab.Playlists -> listOf(YouTube.SearchFilter.FILTER_FEATURED_PLAYLIST, YouTube.SearchFilter.FILTER_COMMUNITY_PLAYLIST)
+        SearchTab.All -> emptyList()
+    }
+
+    /** Switches the result view; filtered lists are fetched on first use and kept for the rest of this search. */
+    fun selectSearchTab(tab: SearchTab) {
+        searchTab = tab
+        if (tab == SearchTab.All) return
+        tabCache[tab]?.let { (items, cont) -> tabItems = items; tabContinuation = cont; tabMore = cont != null; tabLoading = false; return }
+        tabItems = emptyList(); tabContinuation = null; tabMore = false; tabLoading = true
+        val gen = searchGeneration; val q = searchedQuery
+        scope.launch {
+            val items = mutableListOf<YTItem>()
+            var cont: String? = null
+            var failed = false
+            for (f in filtersFor(tab)) {
+                YouTube.search(q, f).onSuccess { items += it.items; cont = it.continuation }.onFailure { failed = true }
+            }
+            if (gen != searchGeneration || tab != searchTab) return@launch
+            val unique = items.distinctBy { it.id }.let { list ->
+                if (tab == SearchTab.Songs || tab == SearchTab.Videos) SearchRank.rank(q, list.filterIsInstance<SongItem>()) else list
+            }
+            if (failed && unique.isEmpty()) showToast("Couldn't load ${tab.label.lowercase()}. Check your connection.") else tabCache[tab] = unique to cont
+            tabItems = unique; tabContinuation = cont; tabMore = cont != null; tabLoading = false
+        }
+    }
+
+    /** "Show more" under a filtered list: the next page of YouTube Music's results. */
+    fun loadMoreSearch() {
+        val cont = tabContinuation ?: return
+        if (tabLoading) return
+        tabLoading = true
+        val gen = searchGeneration; val tab = searchTab
+        scope.launch {
+            YouTube.searchContinuation(cont)
+                .onSuccess { r ->
+                    if (gen != searchGeneration || tab != searchTab) return@onSuccess
+                    tabItems = (tabItems + r.items).distinctBy { it.id }
+                    tabContinuation = r.continuation; tabMore = r.continuation != null
+                    tabCache[tab] = tabItems to tabContinuation
+                }
+                .onFailure { showToast("Couldn't load more results") }
+            tabLoading = false
         }
     }
 

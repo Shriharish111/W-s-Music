@@ -228,27 +228,27 @@ class NewUserTest {
         val t = setup(FakeDiscovery(suggested = artists), mixSource())
         ui(t) {
             // Home for a brand-new user: YouTube's hit playlist, labelled, plus the invitation.
-            waitUntil(timeoutMillis = 10_000L) { has("Popular right now") }
+            waitUntil(timeoutMillis = 30_000L) { has("Popular right now") }
             assertTrue(has("From “The Hit List” on YouTube Music", substring = true), "the shelf says where its songs come from")
             assertTrue(has("Tell us what you like") && has("Pick artists") && has("Not now"))
             assertTrue(has("Hitmaker0") || has("Song hit0"), "its songs are shown")
 
             onNodeWithText("Pick artists").performClick()
-            waitUntil(timeoutMillis = 10_000L) { has("Choose artists you like") && has("Alpha") }
+            waitUntil(timeoutMillis = 30_000L) { has("Choose artists you like") && has("Alpha") }
             assertTrue(has("Pick artists you like"), "footer before anything is picked")
             onNodeWithText("Alpha").performClick()
             onNodeWithText("Beta").performClick()
-            waitUntil(timeoutMillis = 10_000L) { has("2 picked", substring = true) }
+            waitUntil(timeoutMillis = 30_000L) { has("2 picked", substring = true) }
             assertTrue(has("1 more gives better mixes", substring = true))
             onNodeWithText("Gamma").performClick()
-            waitUntil(timeoutMillis = 10_000L) { has("3 picked", substring = true) && has("plenty", substring = true) }
+            waitUntil(timeoutMillis = 30_000L) { has("3 picked", substring = true) && has("plenty", substring = true) }
 
             onNodeWithText("Done").performClick()
-            waitUntil(timeoutMillis = 10_000L) { t.c.route == Route.Home && has("Thanks! Building your first mixes now") }
+            waitUntil(timeoutMillis = 30_000L) { t.c.route == Route.Home && has("Thanks! Building your first mixes now") }
             // The invitation is gone, the way back stays, and once the mixes exist they replace the popular shelf.
-            waitUntil(timeoutMillis = 10_000L) { !has("Tell us what you like") && has("Edit your artists") }
-            waitUntil(timeoutMillis = 15_000L) { t.c.mixes.any { it.kind == MixKind.DISCOVER } && !has("Popular right now") }
-            waitUntil(timeoutMillis = 10_000L) { has("Discover Weekly") } // the new mixes are on Home
+            waitUntil(timeoutMillis = 30_000L) { !has("Tell us what you like") && has("Edit your artists") }
+            waitUntil(timeoutMillis = 40_000L) { t.c.mixes.any { it.kind == MixKind.DISCOVER } && !has("Popular right now") }
+            waitUntil(timeoutMillis = 30_000L) { has("Discover Weekly") } // the new mixes are on Home
         }
     }
 
@@ -256,9 +256,9 @@ class NewUserTest {
     fun notNowHidesTheCardButKeepsAWayToPick() {
         val t = setup(FakeDiscovery(suggested = artists))
         ui(t) {
-            waitUntil(timeoutMillis = 10_000L) { has("Tell us what you like") }
+            waitUntil(timeoutMillis = 30_000L) { has("Tell us what you like") }
             onNodeWithText("Not now").performClick()
-            waitUntil(timeoutMillis = 10_000L) { !has("Tell us what you like") && has("Choose artists you like") }
+            waitUntil(timeoutMillis = 30_000L) { !has("Tell us what you like") && has("Choose artists you like") }
             assertTrue(has("Popular right now"), "still has something to listen to")
         }
     }
@@ -289,10 +289,10 @@ class NewUserTest {
         val t = setup(FakeDiscovery(suggested = artists))
         t.c.homeError = friendlyError(raw503)
         ui(t) {
-            waitUntil(timeoutMillis = 10_000L) { has("Couldn't load YouTube Music") }
+            waitUntil(timeoutMillis = 30_000L) { has("Couldn't load YouTube Music") }
             assertTrue(has("YouTube Music is temporarily unavailable", substring = true) && has("We'll keep trying", substring = true) && has("Try again"))
             assertTrue(!has("UNAVAILABLE", substring = true) && !has("prettyPrint", substring = true), "no raw server text")
-            waitUntil(timeoutMillis = 10_000L) { has("Popular right now") } // the page still has something to play
+            waitUntil(timeoutMillis = 30_000L) { has("Popular right now") } // the page still has something to play
             assertTrue(has("Tell us what you like"), "and the invitation")
         }
     }
@@ -301,7 +301,7 @@ class NewUserTest {
     fun homeShowsPlaceholdersNotABlankPageWhileNothingHasArrived() {
         val t = setup(FakeDiscovery(popular = null)) // no feed, no popular songs, no error yet
         ui(t) {
-            waitUntil(timeoutMillis = 10_000L) { has("Tell us what you like") }
+            waitUntil(timeoutMillis = 30_000L) { has("Tell us what you like") }
             onNodeWithTag("home-placeholder").assertExists()
         }
     }

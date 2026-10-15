@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -52,6 +53,10 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.music.innertube.models.SongItem
+import com.music.innertube.models.YTItem
+import com.music.innertube.models.PlaylistItem
+import com.music.innertube.models.ArtistItem
+import com.music.innertube.models.AlbumItem
 import com.music.innertube.pages.MoodAndGenres
 import echopc.db.toSongItem
 import echopc.lyrics.LyricsEntry
@@ -83,11 +88,13 @@ fun SearchPage(c: Controller) {
     val recent by c.library.searchHistory().collectAsState(emptyList())
     val scope = rememberCoroutineScope()
     when {
+        c.typing && c.query.isNotBlank() && c.query.trim() != c.lastSearched -> SuggestionsView(c) // still typing: show matches
         c.searching && c.results.isEmpty() -> EmptyState("Searching for “${c.query}”", "")
         c.searchError != null -> EmptyState("Search didn't work", "${c.searchError}. Check your connection and try again.") {
             PrimaryButton("Try again", { c.search() }, icon = Icons.Rounded.Refresh)
         }
-        c.results.isEmpty() -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(24.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+        c.searchDone && c.results.isEmpty() && c.searchSummaries.isEmpty() -> EmptyState("No results for “${c.query}”", "Check the spelling, or try the artist or album name.")
+        c.results.isEmpty() && c.searchSummaries.isEmpty() -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(24.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
             if (recent.isNotEmpty()) item("recent") {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -108,47 +115,126 @@ fun SearchPage(c: Controller) {
 
 @Composable
 private fun SearchResults(c: Controller) {
-    val songs = c.results
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wide = maxWidth >= 760.dp
+        val columns = ((maxWidth - 24.dp) / 184.dp).toInt().coerceAtLeast(1)
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)) {
-            item("top") {
-                Row(Modifier.padding(horizontal = 24.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                    Column(if (wide) Modifier.weight(0.42f) else Modifier.widthIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Top result", style = MaterialTheme.typography.headlineMedium, color = Ws.text)
-                        TopResultCard(c, songs.first(), songs)
-                    }
-                    if (wide) Column(Modifier.weight(0.58f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Songs", style = MaterialTheme.typography.headlineMedium, color = Ws.text)
-                        songs.drop(1).take(4).forEachIndexed { i, s -> TrackRow(c, s, i + 1, songs, wide = false) }
-                    }
+            item("tabs") {
+                LazyRow(Modifier.padding(bottom = 8.dp), contentPadding = PaddingValues(horizontal = 24.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    itemsIndexed(SearchTab.entries) { _, tab -> WsChip(tab.label, { c.selectSearchTab(tab) }, selected = c.searchTab == tab) }
                 }
             }
-            item("all-title") {
-                Text("All songs", Modifier.padding(start = 24.dp, top = 32.dp, bottom = 8.dp), style = MaterialTheme.typography.headlineMedium, color = Ws.text)
+            when (c.searchTab) {
+                SearchTab.All -> if (c.searchSummaries.isEmpty()) songsOnlyView(c, wide) else allView(c, wide)
+                SearchTab.Songs, SearchTab.Videos -> {
+                    val songs = c.tabItems.filterIsInstance<SongItem>()
+                    if (songs.isNotEmpty()) {
+                        item("columns") { TrackColumns(wide) }
+                        trackRows(c, songs, wide)
+                    }
+                    tabFooter(c)
+                }
+                else -> {
+                    itemsIndexed(c.tabItems.chunked(columns), key = { i, _ -> "grid-$i" }) { _, row ->
+                        Row(Modifier.padding(horizontal = 12.dp)) { row.forEach { ItemCard(c, it, c.tabItems) } }
+                    }
+                    tabFooter(c)
+                }
             }
-            item("columns") { TrackColumns(wide) }
-            trackRows(c, songs, wide)
+        }
+    }
+}
+
+/** Under a filtered list: loading text, "no results", or the button for the next page. */
+private fun LazyListScope.tabFooter(c: Controller) {
+    item("footer") {
+        Column(Modifier.padding(horizontal = 24.dp, vertical = 16.dp)) {
+            when {
+                c.tabLoading -> Text("Loading…", style = MaterialTheme.typography.bodyMedium, color = Ws.muted)
+                c.tabItems.isEmpty() -> Text("No ${c.searchTab.label.lowercase()} found for “${c.query}”.", style = MaterialTheme.typography.bodyMedium, color = Ws.muted)
+                c.tabMore -> OutlineButton("Show more", { c.loadMoreSearch() })
+            }
+        }
+    }
+}
+
+/** Plain song list (used when YouTube's mixed results are not available and only songs could be fetched). */
+private fun LazyListScope.songsOnlyView(c: Controller, wide: Boolean) {
+    val songs = c.results
+    if (songs.isEmpty()) return
+    item("top") {
+        Row(Modifier.padding(horizontal = 24.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+            Column(if (wide) Modifier.weight(0.42f) else Modifier.widthIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Top result", style = MaterialTheme.typography.headlineMedium, color = Ws.text)
+                TopResultCard(c, songs.first(), songs)
+            }
+            if (wide) Column(Modifier.weight(0.58f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Songs", style = MaterialTheme.typography.headlineMedium, color = Ws.text)
+                songs.drop(1).take(4).forEachIndexed { i, s -> TrackRow(c, s, i + 1, songs, wide = false) }
+            }
+        }
+    }
+    item("all-title") {
+        Text("All songs", Modifier.padding(start = 24.dp, top = 32.dp, bottom = 8.dp), style = MaterialTheme.typography.headlineMedium, color = Ws.text)
+    }
+    item("columns") { TrackColumns(wide) }
+    trackRows(c, songs, wide)
+}
+
+/** YouTube Music's mixed results: top result, then songs, videos, albums, artists and playlists, each with a "Show all" link. */
+private fun LazyListScope.allView(c: Controller, wide: Boolean) {
+    val summaries = c.searchSummaries
+    val top = summaries.firstOrNull()?.takeIf { it.title.equals("Top result", ignoreCase = true) }
+    val topItem = top?.items?.firstOrNull()
+    if (topItem != null) item("top") {
+        Column(Modifier.padding(horizontal = 24.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Top result", style = MaterialTheme.typography.headlineMedium, color = Ws.text)
+            Box(Modifier.widthIn(max = 520.dp)) { TopResultCard(c, topItem, c.results) }
+        }
+    }
+    summaries.filter { it !== top }.forEachIndexed { i, section ->
+        val tab = SearchTab.entries.firstOrNull { it != SearchTab.All && it.label.equals(section.title, ignoreCase = true) }
+        item("hdr-$i") {
+            Row(Modifier.padding(start = 24.dp, end = 24.dp, top = 24.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(section.title, Modifier.weight(1f), style = MaterialTheme.typography.headlineMedium, color = Ws.text)
+                if (tab != null) Text("Show all", Modifier.clickable { c.selectSearchTab(tab) }.handCursor(), style = MaterialTheme.typography.labelLarge, color = Ws.muted)
+            }
+        }
+        val songs = section.items.filterIsInstance<SongItem>()
+        if (songs.size == section.items.size) {
+            itemsIndexed(songs, key = { _, song -> "s$i-${song.id}" }) { idx, song -> TrackRow(c, song, idx, songs, wide = false) } // index = position in `songs`
+        } else item("shelf-$i") {
+            LazyRow(contentPadding = PaddingValues(horizontal = 12.dp)) { itemsIndexed(section.items) { _, it -> ItemCard(c, it, section.items) } }
         }
     }
 }
 
 @Composable
-private fun TopResultCard(c: Controller, song: SongItem, songs: List<SongItem>) {
+private fun TopResultCard(c: Controller, item: YTItem, songs: List<SongItem>) {
     val source = remember { MutableInteractionSource() }
     val hovered by source.collectIsHoveredAsState()
+    val kind = when (item) { is SongItem -> if (item.isVideoSong) "Video" else "Song"; is AlbumItem -> "Album"; is ArtistItem -> "Artist"; is PlaylistItem -> "Playlist"; else -> "" }
+    val detail = when (item) {
+        is SongItem -> item.artists.joinToString { it.name }
+        is AlbumItem -> item.artists?.joinToString { it.name }.orEmpty()
+        is PlaylistItem -> item.author?.name.orEmpty()
+        else -> ""
+    }
+    val open = {
+        if (item is SongItem) c.playFromList(songs.ifEmpty { listOf(item) }, songs.indexOfFirst { it.id == item.id }.coerceAtLeast(0)) else c.openItem(item, emptyList())
+    }
     Box(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(if (hovered) Ws.surfaceTop else Ws.surfaceHi)
-            .hoverable(source).clickable(source, null) { c.playFromList(songs, 0) }.handCursor().padding(20.dp),
+            .hoverable(source).clickable(source, null) { open() }.handCursor().padding(20.dp),
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Thumb(song.thumbnail, 92.dp, corner = 6.dp, seed = song.title)
+            Thumb(item.thumbnail, 92.dp, corner = if (item is ArtistItem) 46.dp else 6.dp, seed = item.title)
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(song.title, style = MaterialTheme.typography.headlineLarge, color = Ws.text, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Text("Song • ${song.artists.joinToString { it.name }}", style = MaterialTheme.typography.bodyMedium, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(item.title, style = MaterialTheme.typography.headlineLarge, color = Ws.text, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(listOf(kind, detail).filter { it.isNotBlank() }.joinToString(" • "), style = MaterialTheme.typography.bodyMedium, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
-        if (hovered) PlayButton(false, false, true, { c.playFromList(songs, 0) }, Modifier.align(Alignment.BottomEnd), size = 48.dp, onAccent = true)
+        if (hovered && item !is ArtistItem) PlayButton(false, false, true, { if (item is SongItem) open() else c.playItem(item, emptyList()) }, Modifier.align(Alignment.BottomEnd), size = 48.dp, onAccent = true)
     }
 }
 

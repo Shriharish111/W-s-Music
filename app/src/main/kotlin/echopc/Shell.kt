@@ -58,7 +58,12 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.isBackPressed
+import androidx.compose.ui.input.pointer.isForwardPressed
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.ImeAction
@@ -68,9 +73,23 @@ import java.awt.Cursor
 /** Gap between the panels; the black window shows through. */
 private val Gap = 8.dp
 
+/** The mouse's side buttons (4 = back, 5 = forward) move through pages like a browser's, anywhere in the window. */
+private fun Modifier.sideButtonNavigation(c: Controller): Modifier = pointerInput(c) {
+    awaitPointerEventScope {
+        while (true) {
+            val event = awaitPointerEvent(PointerEventPass.Initial)
+            if (event.type != PointerEventType.Press) continue
+            val back = event.buttons.isBackPressed
+            val forward = event.buttons.isForwardPressed
+            if (back) c.goBack() else if (forward) c.goForward()
+            if (back || forward) event.changes.forEach { it.consume() }
+        }
+    }
+}
+
 @Composable
 fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
-    Box(Modifier.fillMaxSize().background(Ws.bg0)) {
+    Box(Modifier.fillMaxSize().background(Ws.bg0).sideButtonNavigation(c)) {
         Column(Modifier.fillMaxSize()) {
             TopBar(c, onPickAndroidFile)
             Row(Modifier.weight(1f).fillMaxWidth().padding(horizontal = Gap)) {
@@ -209,7 +228,7 @@ private fun TopSearch(c: Controller) {
         Box(Modifier.weight(1f)) {
             if (c.query.isEmpty()) Text("What do you want to play?", style = MaterialTheme.typography.bodyLarge, color = Ws.muted, maxLines = 1)
             BasicTextField(
-                c.query, { c.query = it }, singleLine = true,
+                c.query, { c.typeQuery(it) }, singleLine = true,
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = Ws.text),
                 cursorBrush = SolidColor(Ws.text),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
@@ -219,7 +238,7 @@ private fun TopSearch(c: Controller) {
                     .onKeyEvent { if (it.type == KeyEventType.KeyDown && it.key == Key.Enter) { c.search(); true } else false },
             )
         }
-        if (c.query.isNotEmpty()) WsIconButton(Icons.Rounded.Close, "Clear search", { c.query = "" }, size = 32.dp, iconSize = 18.dp)
+        if (c.query.isNotEmpty()) WsIconButton(Icons.Rounded.Close, "Clear search", { c.typeQuery("") }, size = 32.dp, iconSize = 18.dp)
     }
 }
 

@@ -154,9 +154,14 @@ class CompatPlayer(
  * the current song, so music keeps playing instead of showing an error.
  */
 class AdaptivePlayer(
-    private val onState: (PlayerState) -> Unit,
+    onState: (PlayerState) -> Unit,
     private val onEnded: () -> Unit = {},
 ) : PlayerEngine {
+    /** Everything the engines report goes to the UI; errors are also written to wsmusic.log. */
+    private val onState: (PlayerState) -> Unit = { state ->
+        state.error?.let { Device.log("Playback error: $it") }
+        onState(state)
+    }
     private val loader = AudioLoader()
     private var volume = 0.8
     private var lastId: String? = null

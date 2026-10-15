@@ -34,7 +34,17 @@ data class PlayerState(
  * Downloads a track's audio into a temp file. Results are cached per videoId so the next song
  * can be fetched while the current one plays.
  */
-class AudioLoader {
+/** A download that failed after the stream was resolved; remembers which client served it so the retry can use another. */
+class StreamFailure(val client: String?, cause: Throwable) : Exception(cause.message ?: cause.toString(), cause)
+
+class AudioLoader(
+    /** (videoId, clients to avoid, SABR allowed) -> stream. Replaced in tests. */
+    private val resolver: suspend (String, Set<String>, Boolean) -> ResolvedStream =
+        { id, skip, sabr -> InnerTubeXStream.resolve(id, requireM4a = true, allowSabr = sabr, skipClients = skip) },
+    /** Writes the stream into the file. Replaced in tests. */
+    private val downloadOverride: (suspend (ResolvedStream, Path) -> Unit)? = null,
+    private val retryDelayMs: Long = 500L,
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cache = ConcurrentHashMap<String, Deferred<Path>>()
     private val http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS).build()
@@ -44,44 +54,60 @@ class AudioLoader {
         cache.computeIfAbsent(videoId) {
             scope.async {
                 var lastError: Throwable? = null
-                repeat(3) { attempt ->
+                val skip = mutableSetOf<String>()
+                repeat(MAX_ATTEMPTS) { attempt ->
                     try {
-                        return@async fetch(videoId)
+                        // 1: normal. 2: avoid the client that just failed. 3-4: no SABR (plain ranged URLs), then any client again.
+                        if (attempt == 3) skip.clear()
+                        val path = fetch(videoId, skip, allowSabr = attempt < 2)
+                        if (attempt > 0) Device.log("Stream for $videoId recovered on attempt ${attempt + 1} (avoiding ${skip.ifEmpty { "nothing" }}).")
+                        return@async path
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: Throwable) {
                         lastError = e
-                        println("[loader] $videoId attempt ${attempt + 1} failed: ${e.message?.take(120)}")
-                        kotlinx.coroutines.delay(500L * (attempt + 1))
+                        (e as? StreamFailure)?.client?.let { skip += it }
+                        val client = (e as? StreamFailure)?.client ?: "unknown client"
+                        val msg = "Stream $videoId attempt ${attempt + 1}/$MAX_ATTEMPTS failed via $client: ${e.message?.take(200)}"
+                        println("[loader] $msg")
+                        Device.log(msg)
+                        kotlinx.coroutines.delay(retryDelayMs * (attempt + 1))
                     }
                 }
                 cache.remove(videoId)
+                Device.log("Stream $videoId gave up after $MAX_ATTEMPTS attempts.")
                 throw lastError!!
             }
         }
 
-
     /** One full attempt: resolve a fresh stream URL, then download it. */
-    private suspend fun fetch(videoId: String): Path {
+    private suspend fun fetch(videoId: String, skip: Set<String>, allowSabr: Boolean): Path {
         val t0 = System.currentTimeMillis()
-        val stream = InnerTubeXStream.resolve(videoId, requireM4a = true)
+        val stream = resolver(videoId, skip, allowSabr)
         val t1 = System.currentTimeMillis()
         val file = Files.createTempFile("echopc-", if (stream.mimeType.contains("webm")) ".webm" else ".m4a")
         file.toFile().deleteOnExit()
         try {
-            if (stream.sabr != null) {
+            val override = downloadOverride
+            if (override != null) {
+                override(stream, file)
+            } else if (stream.sabr != null) {
                 val bytes = Files.newOutputStream(file).use { out -> downloadSabrAudio(stream.sabr, out) }
                 if (bytes == 0L) error("SABR stream returned no data (via ${stream.client})")
             } else {
                 downloadRanged(stream, file)
             }
-        } catch (e: Throwable) {
+        } catch (e: kotlinx.coroutines.CancellationException) {
             runCatching { Files.deleteIfExists(file) }
             throw e
+        } catch (e: Throwable) {
+            runCatching { Files.deleteIfExists(file) }
+            throw StreamFailure(stream.client, e)
         }
         println("[loader] $videoId via ${stream.client}: resolve ${t1 - t0} ms, download ${System.currentTimeMillis() - t1} ms")
         return file
     }
+
     /** Drops cached files except those in [keep]. */
     fun retainOnly(keep: Set<String>) {
         for (id in cache.keys.toList()) {
@@ -115,6 +141,8 @@ class AudioLoader {
         if (start == 0L) error("Empty stream (via ${stream.client})")
     }
 }
+
+private const val MAX_ATTEMPTS = 4
 
 /** What the UI needs from a player; lets screenshot/UI tests run without audio. */
 interface PlayerEngine {
