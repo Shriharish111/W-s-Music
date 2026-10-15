@@ -1,7 +1,7 @@
 package echopc
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
@@ -33,6 +33,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.music.innertube.models.AlbumItem
@@ -103,7 +108,12 @@ private fun SuggestionRow(icon: ImageVector?, title: String, subtitle: String?, 
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp).clip(RoundedCornerShape(6.dp))
             .background(if (hovered) Ws.surfaceHi else androidx.compose.ui.graphics.Color.Transparent)
-            .hoverable(source).clickable(source, null, onClick = onClick).handCursor()
+            .hoverable(source)
+            // Not `clickable`: that takes keyboard focus on press, the search box then loses it, and the page used to
+            // switch away from the suggestions before the mouse button came up, so the click was lost.
+            .pointerInput(onClick) { detectTapGestures { onClick() } }
+            .semantics(mergeDescendants = true) { role = Role.Button; onClick { onClick(); true } }
+            .handCursor()
             .height(if (thumb != null) 56.dp else 44.dp).padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
