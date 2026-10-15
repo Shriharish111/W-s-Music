@@ -119,6 +119,19 @@ fun friendlyError(t: Throwable): String {
     }
 }
 
+/** The player bar's reason for a song that would not play, in plain words (the technical text goes to wsmusic.log). */
+fun playbackErrorText(message: String): String {
+    val text = message.lowercase()
+    return when {
+        "attestation" in text || "stream protection" in text -> "YouTube is limiting streams for a moment. Wait a few seconds and play it again."
+        "no playable stream" in text || "found no stream" in text -> "YouTube has no stream for this song right now."
+        else -> {
+            val friendly = friendlyError(RuntimeException(message))
+            if (friendly == "Something went wrong loading this") message.take(120) else friendly
+        }
+    }
+}
+
 /** What the right-hand panel shows. */
 enum class PanelTab { NOW_PLAYING, QUEUE }
 
@@ -980,7 +993,7 @@ class Controller(
             delay(200) // wait for a pause in typing
             YouTube.searchSuggestions(q)
                 .onSuccess { suggestions = it; suggestionsFor = q }
-                .onFailure { Device.log("Suggestions for '$q' failed: ${it.message?.take(120)}") }
+                .onFailure { if (it !is kotlinx.coroutines.CancellationException) Device.log("Suggestions for '$q' failed: ${it.message?.take(120)}") }
             suggestionsLoading = false
         }
     }

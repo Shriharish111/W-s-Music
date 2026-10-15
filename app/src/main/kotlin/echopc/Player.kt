@@ -55,23 +55,27 @@ class AudioLoader(
             scope.async {
                 var lastError: Throwable? = null
                 val skip = mutableSetOf<String>()
+                var protectedByYouTube = false // YouTube asked for attestation: every client fails the same way for a while
                 repeat(MAX_ATTEMPTS) { attempt ->
                     try {
                         // 1: normal. 2: avoid the client that just failed. 3-4: no SABR (plain ranged URLs), then any client again.
+                        // After an attestation block none of that helps, so keep the normal way and wait instead.
                         if (attempt == 3) skip.clear()
-                        val path = fetch(videoId, skip, allowSabr = attempt < 2)
+                        val path = fetch(videoId, skip, allowSabr = protectedByYouTube || attempt < 2)
                         if (attempt > 0) Device.log("Stream for $videoId recovered on attempt ${attempt + 1} (avoiding ${skip.ifEmpty { "nothing" }}).")
                         return@async path
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: Throwable) {
                         lastError = e
-                        (e as? StreamFailure)?.client?.let { skip += it }
+                        val blocked = e.message?.contains("attestation", ignoreCase = true) == true
+                        if (blocked) protectedByYouTube = true else (e as? StreamFailure)?.client?.let { skip += it }
                         val client = (e as? StreamFailure)?.client ?: "unknown client"
                         val msg = "Stream $videoId attempt ${attempt + 1}/$MAX_ATTEMPTS failed via $client: ${e.message?.take(200)}"
                         println("[loader] $msg")
                         Device.log(msg)
-                        kotlinx.coroutines.delay(retryDelayMs * (attempt + 1))
+                        // An attestation block clears by itself after a few seconds: wait longer between tries.
+                        kotlinx.coroutines.delay(retryDelayMs * (attempt + 1) * (if (blocked) 6 else 1))
                     }
                 }
                 cache.remove(videoId)

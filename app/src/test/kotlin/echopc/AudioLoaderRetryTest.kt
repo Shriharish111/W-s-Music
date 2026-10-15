@@ -34,6 +34,30 @@ class AudioLoaderRetryTest {
     }
 
     @Test
+    fun playerBarErrorsAreInPlainWords() {
+        assertEquals(true, "limiting streams" in playbackErrorText("SABR stream protection requires attestation (status 2, retry=1/0)"))
+        assertEquals(true, "no stream" in playbackErrorText("No playable stream found for this track."))
+        assertEquals("There's no internet connection", playbackErrorText("java.net.UnknownHostException: music.youtube.com"))
+    }
+
+    @Test
+    fun anAttestationBlockIsWaitedOutWithTheSameClient() = runBlocking {
+        val calls = mutableListOf<Pair<Set<String>, Boolean>>()
+        var downloads = 0
+        val loader = AudioLoader(
+            resolver = { _, skip, sabr -> calls += skip.toSet() to sabr; stream("VISIONOS") },
+            downloadOverride = { _, file ->
+                if (++downloads <= 2) error("SABR stream protection requires attestation (status 2)")
+                Files.write(file, byteArrayOf(9))
+            },
+            retryDelayMs = 1,
+        )
+        loader.load("vid3").await()
+        assertEquals(3, calls.size)
+        assertTrue(calls.all { it.first.isEmpty() && it.second }, "same client, SABR kept: $calls")
+    }
+
+    @Test
     fun laterAttemptsStopUsingSabrAndEventuallyGiveUp() = runBlocking {
         val calls = mutableListOf<Boolean>()
         val loader = AudioLoader(
