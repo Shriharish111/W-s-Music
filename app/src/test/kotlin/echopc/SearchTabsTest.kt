@@ -3,6 +3,7 @@ package echopc
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.runDesktopComposeUiTest
 import com.music.innertube.models.AlbumItem
 import com.music.innertube.models.Artist
@@ -49,6 +50,10 @@ class SearchTabsTest {
         // Every kind has its tab; the headers carry a "Show all" link.
         assertEquals(SearchTab.entries.size, 6)
         waitUntil(timeoutMillis = 8_000L) { onAllNodesWithText("Show all").fetchSemanticsNodes().size >= 4 }
+        // Clicking a song plays that song (not its neighbour) and queues the section's list.
+        onAllNodesWithText("Beta Track")[0].performClick()
+        waitUntil(timeoutMillis = 8_000L) { c.queue.current != null }
+        assertEquals("fake2", c.queue.current?.id)
         scope.stop()
         repo.close()
     }

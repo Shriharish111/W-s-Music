@@ -201,7 +201,7 @@ private fun LazyListScope.allView(c: Controller, wide: Boolean) {
         }
         val songs = section.items.filterIsInstance<SongItem>()
         if (songs.size == section.items.size) {
-            itemsIndexed(songs, key = { _, song -> "s$i-${song.id}" }) { idx, song -> TrackRow(c, song, idx + 1, songs, wide = false) }
+            itemsIndexed(songs, key = { _, song -> "s$i-${song.id}" }) { idx, song -> TrackRow(c, song, idx, songs, wide = false) } // index = position in `songs`
         } else item("shelf-$i") {
             LazyRow(contentPadding = PaddingValues(horizontal = 12.dp)) { itemsIndexed(section.items) { _, it -> ItemCard(c, it, section.items) } }
         }
