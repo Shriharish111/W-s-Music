@@ -36,7 +36,11 @@ import echopc.reco.ShelfBandit
 import echopc.reco.YouTubeCandidates
 import java.io.File
 import java.util.Properties
+import echopc.sync.RemoteCommand
+import echopc.sync.RemotePlayer
+import echopc.sync.RemoteState
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.serialization.json.put
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -48,6 +52,9 @@ import kotlinx.coroutines.runBlocking
 enum class SearchTab(val label: String) { All("All"), Songs("Songs"), Videos("Videos"), Albums("Albums"), Artists("Artists"), Playlists("Playlists") }
 
 /** A page of the main view. The controller keeps a back stack of these (top bar back/forward). */
+/** What happens to the music while someone talks in voice chat (Discord). */
+enum class VoiceDuck { OFF, LOWER, PAUSE }
+
 sealed interface Route {
     data object Home : Route
     data object Search : Route
@@ -62,6 +69,10 @@ sealed interface Route {
     data object Picker : Route
     /** An online playlist / album / mood page; its content lives in [Controller.details] under [key]. */
     data class Online(val key: String) : Route
+    /** Songs saved for offline listening. */
+    data object Downloads : Route
+    /** Music files on this device. */
+    data object LocalFiles : Route
 }
 
 /** The "where it was played from" string stored with each play. */
@@ -76,6 +87,8 @@ fun routeContext(r: Route): String = when (r) {
     is Route.Online -> r.key
     is Route.Mix -> "mix:${r.id}"
     Route.Picker -> "picker"
+    Route.Downloads -> "downloads"
+    Route.LocalFiles -> "localfiles"
 }
 
 /** What the user asked us to avoid, as quick lookups (from the `feedback` table). */
@@ -119,6 +132,19 @@ fun friendlyError(t: Throwable): String {
     }
 }
 
+/** The player bar's reason for a song that would not play, in plain words (the technical text goes to wsmusic.log). */
+fun playbackErrorText(message: String): String {
+    val text = message.lowercase()
+    return when {
+        "attestation" in text || "stream protection" in text -> "YouTube is limiting streams for a moment. Wait a few seconds and play it again."
+        "no playable stream" in text || "found no stream" in text -> "YouTube has no stream for this song right now."
+        else -> {
+            val friendly = friendlyError(RuntimeException(message))
+            if (friendly == "Something went wrong loading this") message.take(120) else friendly
+        }
+    }
+}
+
 /** What the right-hand panel shows. */
 enum class PanelTab { NOW_PLAYING, QUEUE }
 
@@ -143,21 +169,43 @@ sealed interface DetailUi {
 
 sealed interface ImportUi {
     data object Idle : ImportUi
-    data class Running(val fileName: String) : ImportUi
+    data class Running(val fileName: String, val detail: String = "", val cancellable: Boolean = false) : ImportUi
+    /** A finished import with a plain-words summary. */
+    data class Message(val title: String, val text: String) : ImportUi
     data class Done(val result: ImportResult) : ImportUi
     data class Failed(val message: String) : ImportUi
 }
 
 /** Accent pair derived from album art: the dominant colour plus a hue-shifted partner for gradients. */
 fun accentFrom(dominant: Color): Accent {
-    val hsb = FloatArray(3)
-    java.awt.Color.RGBtoHSB((dominant.red * 255).toInt(), (dominant.green * 255).toInt(), (dominant.blue * 255).toInt(), hsb)
+    val hsb = rgbToHsb(dominant.red, dominant.green, dominant.blue)
     // Warm art (red/orange/yellow) pairs with a pink-red; cooler art pairs with the next hue along.
     val warm = hsb[0] < 0.17f || hsb[0] > 0.93f
     val shift = if (warm) -0.07f else 0.10f
     val partnerHue = ((hsb[0] + shift) % 1f + 1f) % 1f
-    val partner = Color(java.awt.Color.HSBtoRGB(partnerHue, (hsb[1] * 0.9f).coerceIn(0.5f, 0.95f), 1f) or (0xFF shl 24))
+    val partner = hsbToColor(partnerHue, (hsb[1] * 0.9f).coerceIn(0.5f, 0.95f), 1f)
     return Accent(dominant, partner)
+}
+
+/** Hue, saturation, brightness (0..1) of an RGB colour (0..1), as java.awt.Color.RGBtoHSB computes them. */
+internal fun rgbToHsb(r: Float, g: Float, b: Float): FloatArray {
+    val max = maxOf(r, g, b); val min = minOf(r, g, b); val d = max - min
+    val s = if (max == 0f) 0f else d / max
+    val h = when {
+        d == 0f -> 0f
+        max == r -> ((g - b) / d).let { if (it < 0) it + 6f else it } / 6f
+        max == g -> ((b - r) / d + 2f) / 6f
+        else -> ((r - g) / d + 4f) / 6f
+    }
+    return floatArrayOf(h, s, max)
+}
+
+internal fun hsbToColor(h: Float, s: Float, v: Float): Color {
+    val i = (h * 6f).toInt() % 6
+    val f = h * 6f - (h * 6f).toInt()
+    val p = v * (1 - s); val q = v * (1 - f * s); val t = v * (1 - (1 - f) * s)
+    val (r, g, b) = when (i) { 0 -> Triple(v, t, p); 1 -> Triple(q, v, p); 2 -> Triple(p, v, t); 3 -> Triple(p, q, v); 4 -> Triple(t, p, v); else -> Triple(v, p, q) }
+    return Color(r, g, b)
 }
 
 /**
@@ -173,7 +221,7 @@ class Controller(
     recoSource: CandidateSource? = null,
     discoverySource: DiscoverySource? = null,
     engineFactory: (onState: (PlayerState) -> Unit, onEnded: () -> Unit) -> PlayerEngine,
-) {
+) : RemotePlayer {
     // ---- navigation ----
     var backStack by mutableStateOf<List<Route>>(listOf(Route.Home))
         private set
@@ -211,10 +259,20 @@ class Controller(
     var tabMore by mutableStateOf(false)
     private var tabContinuation: String? = null
     private val tabCache = HashMap<SearchTab, Pair<List<YTItem>, String?>>()
+    // ---- self-update ----
+    var update by mutableStateOf<UpdateInfo?>(null)
+    var updateDialogOpen by mutableStateOf(false)
+    var updateProgress by mutableStateOf<Float?>(null)   // 0..1 while the installer downloads
+    var updateError by mutableStateOf<String?>(null)
+    /** "Installing…" once the download is done (silent updates), shown under the progress bar. */
+    var updateStage by mutableStateOf<String?>(null)
+    /** Set by the window: closes the app (saving everything) so the installer can replace it. */
+    var requestExit: (() -> Unit)? = null
+
     private var searchedQuery = ""
     /** What the last finished search was for; the typing view shows while the box differs from it. */
     var lastSearched by mutableStateOf("")
-        private set
+        set // public so tests can stand in for a finished search
     var suggestions by mutableStateOf<SearchSuggestions?>(null)
     var suggestionsFor by mutableStateOf("")
     var suggestionsLoading by mutableStateOf(false)
@@ -230,10 +288,14 @@ class Controller(
 
     // ---- extras ----
     var lyrics by mutableStateOf<LyricsUiState>(LyricsUiState.Idle)
-    var accent by mutableStateOf(Accent(Ws.defaultAccent, Ws.defaultAccent2))
+    var accent by mutableStateOf(Accent.DEFAULT)
     var toast by mutableStateOf<String?>(null)
     var toastAction by mutableStateOf<ToastAction?>(null)
     var importUi by mutableStateOf<ImportUi>(ImportUi.Idle)
+    /** The "Import from Spotify" dialog (paste a link, or choose the Spotify data file). */
+    var spotifyImportOpen by mutableStateOf(false)
+    /** Text for the dialog's link field (filled when a link is shared to the phone app from Spotify). */
+    var spotifyImportDraft by mutableStateOf("")
     var likedIds by mutableStateOf<Set<String>>(emptySet())
     var newPlaylistFor by mutableStateOf<SongItem?>(null) // song to add once created
     var newPlaylistOpen by mutableStateOf(false)
@@ -241,6 +303,43 @@ class Controller(
 
     // ---- recommendations ----
     val recommender = Recommender(library, recoSource ?: YouTubeCandidates(library))
+
+    /** Wi-Fi sync with the user's other device (phone <-> computer). Started by [startSync]. */
+    val sync = echopc.sync.SyncManager(library, scope, onChanged = { changed ->
+        if (echopc.sync.SyncCategory.TASTE in changed || echopc.sync.SyncCategory.LIBRARY in changed) {
+            recommender.invalidateEmpty()
+            refreshMixes()
+        }
+    })
+    var syncOpen by mutableStateOf(false)
+
+    /** Songs saved for offline listening. */
+    val downloads = Downloads(library, scope) { showToast(it) }
+
+    /** Music files on this device (null until looked for). */
+    var localSongs by mutableStateOf<List<SongItem>?>(null)
+    var localScanning by mutableStateOf(false)
+    var localError by mutableStateOf<String?>(null)
+    /** Set when the phone must ask for permission to read music; the screen asks, then calls [scanLocalMusic]. */
+    var localNeedsPermission by mutableStateOf(false)
+
+    /** Looks for music files on this device again. */
+    fun scanLocalMusic() {
+        val source = AppHooks.localMusic ?: run { localError = "Not available here"; return }
+        if (localScanning) return
+        localScanning = true; localError = null
+        scope.launch(Dispatchers.IO) {
+            runCatching { source.scan() }
+                .onSuccess { localSongs = it; localNeedsPermission = false }
+                .onFailure { e ->
+                    if (e is SecurityException) localNeedsPermission = true
+                    else localError = e.message ?: "Couldn't read the music on this device"
+                }
+            localScanning = false
+        }
+    }
+
+    fun startSync() = sync.start()
     var mixes by mutableStateOf<List<GeneratedMix>>(emptyList())
     var mixesRefreshing by mutableStateOf(false)
     private var signalsSinceRefresh = 0
@@ -290,15 +389,54 @@ class Controller(
     /** Where the current queue came from ("liked", "local:<id>", "mix:<id>", ...); radio additions are "radio". */
     var queueContext = "home"
         private set
-    private val radioIds = HashSet<String>()
+    private val radioIds: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
     /** Play logging: one worker runs the writes strictly in the order plays end. */
     private val playLog = kotlinx.coroutines.channels.Channel<suspend () -> Unit>(kotlinx.coroutines.channels.Channel.UNLIMITED)
     private var sideJob: Job? = null
     private var lyricsJob: Job? = null
     private var toastJob: Job? = null
 
+    // Discord mode (declared before init, which reads the saved setting)
+    var voiceDuck by mutableStateOf(VoiceDuck.OFF); private set
+    /** Someone is talking in voice chat right now (while the mode is on). */
+    var voiceTalking by mutableStateOf(false); private set
+    val voiceDuckAvailable: Boolean get() = AppHooks.voiceMeter != null
+    private var voiceMeter: AutoCloseable? = null
+    @Volatile private var duckFactor = 1f
+    @Volatile private var pausedByVoice = false
+    @Volatile private var lastVoiceAt = 0L
+
+    // ---- sleep timer ----
+    /** When the sleep timer will pause the music (epoch ms), or null. */
+    var sleepEndsAt by mutableStateOf<Long?>(null)
+        private set
+    /** Pause when the current song finishes. */
+    var sleepAtSongEnd by mutableStateOf(false)
+        private set
+    val sleepTimerOn: Boolean get() = sleepEndsAt != null || sleepAtSongEnd
+    private var sleepJob: Job? = null
+
+    /** Puts text on the clipboard (the app plugs in how); replaced in tests. */
+    var copyText: (String) -> Unit = { AppHooks.copyText(it) }
+
+    // ---- streams being retried ----
+    private var retryingIds by mutableStateOf<Set<String>>(emptySet())
+    /** The current song failed to load at least once and is being tried again. */
+    val retryingNow: Boolean get() = !remoteControlling && playback.loading && queue.current?.id in retryingIds
+
+    // ---- persistent queue: the last song comes back (paused) on the next launch ----
+    private val queueStore: QueueStore? = settingsFile?.let { QueueStore(File(it.parentFile, "queue.txt")) }
+    /** True while the queue was restored from the last run and its song hasn't been loaded into the engine yet. */
+    var resumePending by mutableStateOf(false)
+        private set
+    /** Where to jump once the engine has the song ready (-1: nowhere). */
+    private var resumeSeekMs = -1L
+    /** A resumed song started part-way in; that part doesn't count as listened. */
+    private var resumeBaseMs = 0L
+
     init {
         loadSettings()
+        restoreQueue()
         engine.setVolume(volume.toDouble())
         scope.launch { library.likedIds.collect { likedIds = it.toSet() } }
         scope.launch {
@@ -309,21 +447,123 @@ class Controller(
             }
         }
         scope.launch { library.tastePicks.collect { tastePicks = it } }
+        scope.launch { StreamStatus.retrying.collect { retryingIds = it } }
         scope.launch { library.feedback.collect { blocks = Blocks.from(it) } }
         scope.launch { loadShelfStats() }
         scope.launch(Dispatchers.IO) { for (write in playLog) runCatching { write() } }
+        sync.remote.player = this
+        applyVoiceMeter()
+        downloads.start()
+        OfflineFiles.find = { id ->
+            if (OfflineFiles.isLocal(id)) java.nio.file.Path.of(id.removePrefix(OfflineFiles.LOCAL_PREFIX)) else downloads.fileFor(id)?.toPath()
+        }
+        // Tell the other device when what plays here changes (not on every position tick).
+        scope.launch {
+            androidx.compose.runtime.snapshotFlow {
+                listOf(queue.current?.id, queue.index, queue.items.size, playback.playing, playback.loading, playback.durationMs, volume, queue.repeat)
+            }.collect { sync.remote.localChanged() }
+        }
+        // Keep the saved queue fresh (also covers a crash or a forced close).
+        if (queueStore != null) scope.launch(Dispatchers.IO) {
+            var last: SavedQueue? = null
+            while (true) {
+                delay(15_000)
+                val now = snapshotQueue()
+                if (now != last) { queueStore.save(::snapshotQueue); last = now }
+            }
+        }
     }
 
     // ---------------- engine callbacks ----------------
 
     private fun onEngineState(s: PlayerState) {
+        if (s.playing) lastPlayedAt = System.currentTimeMillis()
+        if (pendingSeekMs > 0 && s.durationMs > 0 && !s.loading) { val to = pendingSeekMs; pendingSeekMs = 0; engine.seek(to); positionMs = to }
+        if (pendingPause && s.playing) { pendingPause = false; engine.togglePause() }
+        if (resumeSeekMs >= 0 && s.error == null) {
+            // A resumed song: jump to where it was left as soon as the engine has it ready.
+            val f = s.copy(positionMs = 0); if (f != playback) playback = f
+            if (s.loading || !s.playing || s.durationMs <= 0) return
+            val to = resumeSeekMs.coerceAtMost((s.durationMs - 1_000).coerceAtLeast(0))
+            resumeSeekMs = -1
+            engine.seek(to)
+            positionMs = to; playedMax = to
+            return
+        }
+        resumeSeekMs = -1
         if (s.positionMs != positionMs) positionMs = s.positionMs
         if (s.positionMs > playedMax) playedMax = s.positionMs
         val flags = s.copy(positionMs = 0)
-        if (flags != playback) playback = flags
+        if (flags != playback) { playback = flags; sync.remote.localChanged() }
     }
 
-    private fun onEnded() = skipNext(auto = true)
+    private fun onEnded() {
+        if (!sleepAtSongEnd) { skipNext(auto = true); return }
+        // Sleep timer: stop here, with the next song lined up (paused) for when you're back.
+        sleepAtSongEnd = false
+        flushPlay(EndReason.TRACK_DONE)
+        queue.nextIndex(auto = true)?.let { queue = queue.jump(it) }
+        holdAt(0)
+        showToast("Sleep timer: paused")
+    }
+
+    // ---------------- sleep timer ----------------
+
+    /** Pauses the music in [minutes], fading out over the last few seconds. */
+    fun startSleepTimer(minutes: Int, durationMs: Long = minutes * 60_000L) {
+        cancelSleepTimer()
+        sleepEndsAt = System.currentTimeMillis() + durationMs
+        sleepJob = scope.launch {
+            delay(durationMs)
+            pausedByVoice = false // voice chat must not start the music again
+            if (remoteControlling) {
+                if (nowPlayback.playing) controlRemote(RemoteCommand.simple("pause"))
+            } else if (playback.playing) {
+                for (step in 9 downTo 1) { engine.setVolume(volume * duckFactor * step / 10.0); delay(300) }
+                if (playback.playing) engine.togglePause()
+                engine.setVolume((volume * duckFactor).toDouble())
+            } else if (playback.loading) {
+                flushPlay(EndReason.CLOSED); holdAt(positionMs)
+            }
+            sleepEndsAt = null
+            showToast("Sleep timer: paused")
+        }
+        showToast("Music will pause in $minutes ${if (minutes == 1) "minute" else "minutes"}")
+    }
+
+    fun sleepAfterSong() {
+        cancelSleepTimer()
+        sleepAtSongEnd = true
+        showToast("Music will pause after this song")
+    }
+
+    fun cancelSleepTimer() {
+        if (sleepJob?.isActive == true) engine.setVolume((volume * duckFactor).toDouble()) // in case it was fading
+        sleepJob?.cancel(); sleepJob = null
+        sleepEndsAt = null; sleepAtSongEnd = false
+    }
+
+    /** Unloads the engine but keeps the current song in the bar, ready to play from [ms]. */
+    private fun holdAt(ms: Long) {
+        val song = queue.current ?: return
+        engine.stop()
+        resumeSeekMs = -1
+        playback = PlayerState(durationMs = (song.duration ?: 0) * 1000L)
+        positionMs = ms
+        resumePending = true
+        loadSideEffects(song)
+        persistQueueSoon()
+    }
+
+    // ---------------- sharing ----------------
+
+    /** Copies a link to [song]: YouTube Music's own, or a Song.link page that offers other platforms. */
+    fun copyLink(song: SongItem, allPlatforms: Boolean = false) {
+        val link = if (allPlatforms) "https://song.link/y/${song.id}" else "https://music.youtube.com/watch?v=${song.id}"
+        runCatching { copyText(link) }
+            .onSuccess { showToast("Link copied") }
+            .onFailure { showToast("Couldn't copy the link") }
+    }
 
     // ---------------- playback control ----------------
 
@@ -333,7 +573,7 @@ class Controller(
      */
     private fun flushPlay(endReason: String) {
         val song = playingSong ?: return
-        val ms = playedMax
+        val ms = (playedMax - resumeBaseMs).coerceAtLeast(0)
         val duration = playback.durationMs.takeIf { it > 0 } ?: ((song.duration ?: 0) * 1000L)
         val reason = if (playback.error != null) EndReason.ERROR else endReason
         val start = playStartReason; val context = playContext
@@ -350,8 +590,10 @@ class Controller(
     }
 
     /** Starts the queue's current song; [start] says why it starts, [ended] why the previous one stopped. */
-    fun startCurrent(start: String = StartReason.CLICK_ROW, ended: String = EndReason.NEW_SELECTION, backwards: Boolean = false) {
+    fun startCurrent(start: String = StartReason.CLICK_ROW, ended: String = EndReason.NEW_SELECTION, backwards: Boolean = false, resumeAtMs: Long = 0) {
         if (queue.current == null) return
+        resumePending = false
+        resumeSeekMs = -1
         // Hidden songs and blocked artists are passed over, like Spotify does.
         val target = playableIndex(queue.index, backwards)
         if (target == null) {
@@ -365,10 +607,14 @@ class Controller(
         playingSong = song
         playStartReason = if (song.id in queue.recommended) StartReason.SMART_SHUFFLE else start
         playContext = if (song.id in radioIds) "radio" else queueContext
-        positionMs = 0
+        resumeBaseMs = resumeAtMs.coerceAtLeast(0)
+        resumeSeekMs = if (resumeAtMs > 0) resumeAtMs else -1
+        positionMs = resumeBaseMs
         engine.play(song.id, queue.upNext?.id)
-        if (queue.upNext == null && autoplay) extendWithRadio(song, thenPlayFirstNew = false, ended = ended)
+        sync.remote.localChanged()
+        if (queue.upNext == null && autoplay && !OfflineFiles.isLocal(song.id)) extendWithRadio(song, thenPlayFirstNew = false, ended = ended)
         loadSideEffects(song)
+        persistQueueSoon()
     }
 
     /** First playable position from [from], searching forward (or backward first for Previous). */
@@ -383,10 +629,10 @@ class Controller(
     private fun loadSideEffects(song: SongItem) {
         lyricsJob?.cancel(); sideJob?.cancel()
         lyrics = LyricsUiState.Loading
-        lyricsJob = scope.launch { lyrics = LyricsRepository.load(song) }
+        lyricsJob = scope.launch { lyrics = AppHooks.loadLyrics(song) }
         sideJob = scope.launch {
-            val dominant = song.thumbnail.takeIf { it.isNotBlank() }?.let { ThumbCache.load(it, 128)?.dominant }
-            accent = if (dominant != null) accentFrom(dominant) else Accent(Ws.defaultAccent, Ws.defaultAccent2)
+            val dominant = song.thumbnail.takeIf { it.isNotBlank() }?.let { AppHooks.dominantColor(it) }
+            accent = if (dominant != null) accentFrom(dominant) else Accent.DEFAULT
         }
     }
 
@@ -402,21 +648,38 @@ class Controller(
     }
 
     fun skipNext(auto: Boolean = false) {
+        if (!auto && remoteControlling) { controlRemote(RemoteCommand.simple("next")); return }
+        localSkipNext(auto)
+    }
+
+    private fun localSkipNext(auto: Boolean) {
         val ni = queue.nextIndex(auto)
         val reason = if (auto) EndReason.TRACK_DONE else EndReason.FWD_BUTTON
         when {
             ni != null -> { queue = queue.jump(ni); startCurrent(if (auto) StartReason.TRACK_DONE else StartReason.FWD_BUTTON, reason) }
-            autoplay && queue.current != null -> extendWithRadio(queue.current!!, thenPlayFirstNew = true, ended = reason)
+            autoplay && queue.current != null && !OfflineFiles.isLocal(queue.current!!.id) -> extendWithRadio(queue.current!!, thenPlayFirstNew = true, ended = reason)
             else -> { flushPlay(reason); engine.stop() }
         }
     }
 
     fun skipPrevious() {
-        if (positionMs > 3000) { seek(0); return }
+        if (remoteControlling) { controlRemote(RemoteCommand.simple("prev")); return }
+        localSkipPrevious()
+    }
+
+    private fun localSkipPrevious() {
+        if (positionMs > 3000) { localSeek(0); return }
         queue.previousIndex()?.let { queue = queue.jump(it); startCurrent(StartReason.BACK_BUTTON, EndReason.BACK_BUTTON, backwards = true) }
     }
 
-    fun togglePause() = engine.togglePause()
+    /** Play/pause. After a restart the restored song is only loaded now, from where it was left. */
+    fun togglePause() {
+        if (remoteControlling) { controlRemote(RemoteCommand.simple("toggle")); return }
+        val resuming = !playback.playing
+        pausedByVoice = false // the person decided; voice chat doesn't resume it
+        localToggle()
+        if (resuming) claimActive()
+    }
 
     fun toggleMute() {
         if (volume == 0f) changeVolume(volumeBeforeMute.coerceAtLeast(0.05f))
@@ -451,20 +714,97 @@ class Controller(
     }
 
     private fun seekBy(deltaMs: Long) {
-        val duration = playback.durationMs
-        if (queue.current == null || duration <= 0) return
-        seek((positionMs + deltaMs).coerceIn(0L, duration))
+        val duration = nowPlayback.durationMs
+        if (nowQueue.current == null || duration <= 0) return
+        seek((nowPositionMs + deltaMs).coerceIn(0L, duration))
     }
 
     private fun nudgeVolume(delta: Float) {
         changeVolume((volume + delta).coerceIn(0f, 1f))
         showToast("Volume ${(volume * 100).toInt()}%")
     }
-    fun seek(ms: Long) { positionMs = ms; engine.seek(ms) }
-    fun changeVolume(v: Float) { volume = v; engine.setVolume(v.toDouble()) }
+    fun seek(ms: Long) { if (remoteControlling) controlRemote(RemoteCommand.seek(ms)) else localSeek(ms) }
+    private fun localSeek(ms: Long) {
+        positionMs = ms
+        when {
+            resumePending -> {} // nothing loaded yet: play will start from here
+            resumeSeekMs >= 0 -> resumeSeekMs = ms.coerceAtLeast(0) // still loading the resumed song
+            else -> engine.seek(ms)
+        }
+        sync.remote.localChanged()
+    }
+
+    private fun localToggle() {
+        // A song that failed, or is stuck retrying, gets a fresh start: pausing it would do nothing.
+        if (resumePending || playback.error != null || retryingNow) startCurrent(StartReason.CLICK_ROW, EndReason.NEW_SELECTION, resumeAtMs = positionMs)
+        else engine.togglePause()
+    }
+    fun changeVolume(v: Float) { if (remoteControlling) controlRemote(RemoteCommand.volume(v)) else localVolume(v) }
+    private fun localVolume(v: Float) { volume = v; engine.setVolume((v * duckFactor).toDouble()); sync.remote.localChanged() }
+
+    // ---------------- Discord mode: quieter (or paused) while someone talks ----------------
+
+
+    fun changeVoiceDuck(mode: VoiceDuck) {
+        voiceDuck = mode
+        saveSettings()
+        applyVoiceMeter()
+        if (mode != VoiceDuck.OFF && !voiceDuckAvailable) showToast("This only works on the computer")
+    }
+
+    private fun applyVoiceMeter() {
+        if (voiceDuck == VoiceDuck.OFF) {
+            runCatching { voiceMeter?.close() }; voiceMeter = null
+            if (voiceTalking) endTalking()
+            setDuck(1f)
+        } else if (voiceMeter == null) {
+            voiceMeter = runCatching { AppHooks.voiceMeter?.invoke(::onVoiceLevel) }.getOrNull()
+        }
+    }
+
+    /** About 20 times a second, from the meter's thread. */
+    internal fun onVoiceLevel(level: Float) {
+        if (voiceDuck == VoiceDuck.OFF) return
+        val now = System.currentTimeMillis()
+        if (level > VOICE_THRESHOLD) {
+            lastVoiceAt = now
+            if (!voiceTalking) startTalking()
+        } else if (voiceTalking && now - lastVoiceAt > if (voiceDuck == VoiceDuck.PAUSE) 1500 else 800) {
+            endTalking()
+        }
+        // Down quickly, back up gently.
+        val target = if (voiceTalking && voiceDuck == VoiceDuck.LOWER) DUCKED_VOLUME else 1f
+        if (duckFactor != target) setDuck(if (target < duckFactor) maxOf(target, duckFactor - 0.4f) else minOf(target, duckFactor + 0.08f))
+    }
+
+    private fun setDuck(f: Float) { duckFactor = f; engine.setVolume((volume * f).toDouble()) }
+
+    private fun startTalking() {
+        voiceTalking = true
+        if (voiceDuck == VoiceDuck.PAUSE && playback.playing) { pausedByVoice = true; engine.togglePause() }
+    }
+
+    private fun endTalking() {
+        voiceTalking = false
+        if (pausedByVoice) {
+            pausedByVoice = false
+            if (!playback.playing && queue.current != null) engine.togglePause()
+        }
+    }
 
     /** Plays [list] from [index]; the page it was started from becomes the play context. */
     fun playFromList(list: List<SongItem>, index: Int, context: String = routeContext(route)) {
+        if (remoteControlling) {
+            // Like Spotify: what you pick plays on the device that is playing.
+            val shuffled = shuffleMode(context) != ShuffleMode.OFF && index in list.indices
+            val ordered = if (shuffled) listOf(list[index]) + list.filterIndexed { i, _ -> i != index }.shuffled() else list
+            controlRemote(RemoteCommand.queue(ordered, if (shuffled) 0 else index, context))
+            val name = playingOn
+            // Say where it plays, with a way to play it here instead.
+            showToast("Playing on $name", ToastAction("Play here") { lastRemoteActionAt = 0; playHere() })
+            return
+        }
+        claimActive()
         queueContext = context
         radioIds.clear()
         queueOriginal = list
@@ -490,23 +830,38 @@ class Controller(
         if (shuffleMode(ctx) == ShuffleMode.OFF) shuffleModes[ctx] = ShuffleMode.ON
         playCollection(list, ctx)
     }
-    fun jumpTo(index: Int) { queue = queue.jump(index); startCurrent() }
+    fun jumpTo(index: Int) { if (remoteControlling) controlRemote(RemoteCommand.jump(index)) else { queue = queue.jump(index); startCurrent() } }
 
     fun addToQueue(song: SongItem) {
+        if (remoteControlling) { controlRemote(RemoteCommand.song("add", song)); showToast("Added to the queue on $playingOn"); return }
         val was = queue.items.isEmpty(); queue = queue.add(song)
         if (was) { queue = queue.jump(0); startCurrent() } else showToast("Added to queue")
     }
 
     fun playNext(song: SongItem) {
+        if (remoteControlling) { controlRemote(RemoteCommand.song("playnext", song)); showToast("Playing next on $playingOn"); return }
         queue = queue.playNext(song)
         if (queue.items.size == 1) { queue = queue.jump(0); startCurrent() } else { queue.upNext?.let { engine.prefetch(it.id) }; showToast("Playing next") }
     }
 
-    fun removeFromQueue(position: Int) { queue = queue.remove(position) }
+    fun removeFromQueue(position: Int) {
+        if (remoteControlling) { controlRemote(kotlinx.serialization.json.buildJsonObject { put("t", "remove"); put("index", position) }); return }
+        queue = queue.remove(position); sync.remote.localChanged()
+    }
+
+    /** Drag to reorder: moves the song at [from] to [to] in the queue. */
+    fun moveInQueue(from: Int, to: Int) {
+        if (remoteControlling) { controlRemote(kotlinx.serialization.json.buildJsonObject { put("t", "move"); put("from", from); put("to", to) }); return }
+        queue = queue.move(from, to)
+        queue.upNext?.let { engine.prefetch(it.id) }
+        sync.remote.localChanged()
+    }
     fun shuffleQueue() { queue = queue.shuffledUpcoming(); queue.upNext?.let { engine.prefetch(it.id) } }
     fun clearQueue() {
         flushPlay(EndReason.CLOSED); engine.stop(); queue = QueueState(); lyrics = LyricsUiState.Idle
-        accent = Accent(Ws.defaultAccent, Ws.defaultAccent2)
+        accent = Accent.DEFAULT
+        resumePending = false; resumeSeekMs = -1; playback = PlayerState(); positionMs = 0
+        persistQueueSoon()
     }
     // ---------------- shuffle & Smart Shuffle ----------------
 
@@ -652,7 +1007,134 @@ class Controller(
         }
     }
 
-    fun cycleRepeat() { queue = queue.copy(repeat = RepeatMode.entries[(queue.repeat.ordinal + 1) % RepeatMode.entries.size]) }
+    fun cycleRepeat() { if (remoteControlling) controlRemote(RemoteCommand.simple("repeat")) else localCycleRepeat() }
+    private fun localCycleRepeat() { queue = queue.copy(repeat = RepeatMode.entries[(queue.repeat.ordinal + 1) % RepeatMode.entries.size]); sync.remote.localChanged() }
+
+    // ---------------- remote control and handoff (like Spotify Connect) ----------------
+
+    private var lastPlayedAt = 0L
+    private var pendingSeekMs = 0L
+    private var pendingPause = false
+
+    /** The paired device's playback while it is connected. */
+    val remoteDevice: RemoteState? get() = sync.remote.other?.takeIf { sync.remote.connected }
+
+    private fun localIdleMs(): Long = when {
+        playback.playing -> 0
+        lastPlayedAt == 0L -> Long.MAX_VALUE / 4
+        else -> System.currentTimeMillis() - lastPlayedAt
+    }
+
+    /** When this device last sent the other one a control (play, pause, next, a song, ...), or chose it in Devices. */
+    @Volatile private var lastRemoteActionAt = 0L
+
+    /** Sends a control to the other device; while used like that, it stays the one these buttons control. */
+    private fun controlRemote(command: kotlinx.serialization.json.JsonObject) {
+        lastRemoteActionAt = System.currentTimeMillis()
+        sync.remote.send(command)
+    }
+
+    /**
+     * True while the other device is the active one: it is playing, or this device was used as its remote in the
+     * last 10 minutes (so a pause from here can be undone from here). Then the player shows it, and the buttons and
+     * song picks control it. A paused computer does not take over the phone's taps by itself.
+     */
+    val remoteControlling: Boolean
+        get() {
+            val o = remoteDevice ?: return false
+            if (o.current == null || playback.playing) return false
+            if (o.playing || o.loading) return true
+            return System.currentTimeMillis() - lastRemoteActionAt < 10 * 60_000L && o.idleNow() < 10 * 60_000L
+        }
+
+    /** "Redmi Note 8" while controlling it ("Playing on …"). */
+    val playingOn: String? get() = if (remoteControlling) remoteDevice?.name else null
+
+    // What the player shows: this device, or the other one while controlling it.
+    val nowQueue: QueueState
+        get() = remoteDevice?.takeIf { remoteControlling }?.let { o ->
+            QueueState(o.items, o.index, runCatching { RepeatMode.valueOf(o.repeat) }.getOrDefault(RepeatMode.OFF))
+        } ?: queue
+    val nowPlayback: PlayerState
+        get() = remoteDevice?.takeIf { remoteControlling }?.let { PlayerState(loading = it.loading, playing = it.playing, durationMs = it.durationMs) } ?: playback
+    val nowPositionMs: Long get() = if (remoteControlling) sync.remote.otherPositionMs else positionMs
+    val nowVolume: Float get() = remoteDevice?.takeIf { remoteControlling }?.volume ?: volume
+
+    /** Only one device plays at a time: starting here pauses the other one. */
+    private fun claimActive() {
+        if (remoteDevice?.playing == true) sync.remote.send(RemoteCommand.simple("pause"))
+    }
+
+    /** Moves what this device plays (queue, song, position) to the other device. */
+    fun playOnOtherDevice() {
+        val o = remoteDevice ?: return
+        val current = queue.current ?: return
+        if (OfflineFiles.isLocal(current.id)) { showToast("This song's file is only on this device, so it can't play on ${o.name}"); return }
+        // Files that are only on this device can't play there; the rest of the queue goes.
+        val items = queue.items.filter { !OfflineFiles.isLocal(it.id) }
+        controlRemote(RemoteCommand.queue(items, items.indexOfFirst { it.id == current.id }, queueContext, positionMs, playing = true, repeat = queue.repeat.name))
+        if (playback.playing) engine.togglePause()
+        showToast("Playing on ${o.name}")
+    }
+
+    /** Takes over what the other device plays and continues here. */
+    fun playHere() {
+        val o = remoteDevice ?: return
+        if (o.current == null) return
+        lastRemoteActionAt = 0 // this device plays now; its buttons are its own again
+        startQueue(o.items, o.index, o.context.ifEmpty { "remote" }, o.positionNow(), playing = true, repeat = o.repeat)
+        sync.remote.send(RemoteCommand.simple("pause"))
+    }
+
+    private fun startQueue(items: List<SongItem>, index: Int, context: String, positionMs: Long, playing: Boolean, repeat: String) {
+        if (index !in items.indices) return
+        queueContext = context
+        radioIds.clear()
+        queueOriginal = items
+        queue = QueueState(items, index, runCatching { RepeatMode.valueOf(repeat) }.getOrDefault(RepeatMode.OFF))
+        pendingSeekMs = positionMs.coerceAtLeast(0)
+        pendingPause = !playing
+        startCurrent()
+    }
+
+    override fun remoteSnapshot(): RemoteState {
+        // A long queue is cut to the part around the current song.
+        val from = (queue.index - 50).coerceAtLeast(0)
+        val items = queue.items.drop(from).take(250)
+        return RemoteState(
+            deviceId = sync.myId, name = AppHooks.deviceName(), items = items, index = queue.index - from, repeat = queue.repeat.name,
+            playing = playback.playing, loading = playback.loading, positionMs = positionMs, durationMs = playback.durationMs,
+            volume = volume, idleMs = localIdleMs(), context = queueContext,
+        )
+    }
+
+    /** A command from the other device; it runs here and is never sent on. */
+    override fun runRemote(command: kotlinx.serialization.json.JsonObject) {
+        fun str(k: String) = (command[k] as? kotlinx.serialization.json.JsonPrimitive)?.content
+        when (str("t")) {
+            "toggle" -> if (queue.current != null) localToggle()
+            "play" -> if (!playback.playing && queue.current != null) localToggle()
+            "pause" -> if (playback.playing) engine.togglePause()
+            "next" -> localSkipNext(false)
+            "prev" -> localSkipPrevious()
+            "seek" -> str("ms")?.toLongOrNull()?.let { localSeek(it) }
+            "volume" -> str("v")?.toFloatOrNull()?.let { localVolume(it.coerceIn(0f, 1f)) }
+            "jump" -> str("index")?.toIntOrNull()?.takeIf { it in queue.items.indices }?.let { queue = queue.jump(it); startCurrent() }
+            "repeat" -> localCycleRepeat()
+            "move" -> { val from = str("from")?.toIntOrNull(); val to = str("to")?.toIntOrNull(); if (from != null && to != null) { queue = queue.move(from, to); queue.upNext?.let { engine.prefetch(it.id) } } }
+            "remove" -> str("index")?.toIntOrNull()?.takeIf { it != queue.index }?.let { queue = queue.remove(it) }
+            "add", "playnext" -> RemoteCommand.song(command)?.let { song ->
+                val was = queue.items.isEmpty()
+                queue = if (str("t") == "add") queue.add(song) else queue.playNext(song)
+                if (was) { queue = queue.jump(0); startCurrent() }
+            }
+            "queue" -> startQueue(
+                RemoteCommand.items(command), str("index")?.toIntOrNull() ?: 0, str("context") ?: "remote",
+                str("pos")?.toLongOrNull() ?: 0, str("playing") != "false", str("repeat") ?: "OFF",
+            )
+        }
+        sync.remote.localChanged()
+    }
 
     // ---------------- home feed ----------------
 
@@ -980,7 +1462,7 @@ class Controller(
             delay(200) // wait for a pause in typing
             YouTube.searchSuggestions(q)
                 .onSuccess { suggestions = it; suggestionsFor = q }
-                .onFailure { Device.log("Suggestions for '$q' failed: ${it.message?.take(120)}") }
+                .onFailure { if (it !is kotlinx.coroutines.CancellationException) AppHooks.log("Suggestions for '$q' failed: ${it.message?.take(120)}") }
             suggestionsLoading = false
         }
     }
@@ -1010,7 +1492,7 @@ class Controller(
                     .onFailure { failure = it }
             }
             if (gen != searchGeneration) return@launch
-            failure?.let { Device.log("Search for '$q' failed: ${it.message?.take(200)}"); searchError = friendlyError(it) }
+            failure?.let { AppHooks.log("Search for '$q' failed: ${it.message?.take(200)}"); searchError = friendlyError(it) }
             searching = false; searchDone = true
         }
     }
@@ -1101,6 +1583,49 @@ class Controller(
         }
     }
 
+    private var spotifyImportJob: Job? = null
+
+    /** Imports a public Spotify playlist or album from a pasted link. */
+    fun importSpotifyLink(text: String) = runSpotifyImport("Spotify link", "Opening the Spotify page…") { SpotifyLink.fetch(text) }
+
+    /** Imports song links copied from the Spotify desktop app (Ctrl+A, Ctrl+C) into Liked Songs or a new playlist. */
+    fun importSpotifySongs(text: String, asLiked: Boolean, playlistName: String) {
+        val ids = SpotifyLink.trackIds(text)
+        runSpotifyImport("Spotify songs", "Reading ${ids.size} songs from Spotify…") { step ->
+            SpotifyLink.fetchTracks(ids, asLiked, playlistName) { done, total -> step("Reading songs from Spotify: $done of $total") }
+        }
+    }
+
+    /** Imports the Spotify data download (.zip) or one of its .json files; [read] gives the file's bytes. */
+    fun importSpotifyFile(name: String, read: () -> ByteArray) =
+        runSpotifyImport(name, "Reading $name…") { SpotifyFiles.read(name, read()) }
+
+    private fun runSpotifyImport(source: String, firstStep: String, load: suspend (step: (String) -> Unit) -> SpotifyExport) {
+        spotifyImportOpen = false
+        spotifyImportJob?.cancel()
+        importUi = ImportUi.Running(source, firstStep, cancellable = true)
+        spotifyImportJob = scope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                val export = load { importUi = ImportUi.Running(source, it, cancellable = true) }
+                SpotifyImporter(library).import(export) { done, total ->
+                    importUi = ImportUi.Running(source, "Finding your songs on YouTube Music: $done of $total", cancellable = true)
+                }
+            }
+            if (result.exceptionOrNull() is kotlinx.coroutines.CancellationException) return@launch
+            importUi = result.fold(
+                { ImportUi.Message("Spotify import complete", it.text()) },
+                { AppHooks.log("Spotify import failed: ${it.message?.take(200)}"); ImportUi.Failed(it.message ?: "The Spotify import didn't work") },
+            )
+            if (result.isSuccess) { recommender.invalidateEmpty(); refreshMixes(force = true) } // the new songs change taste
+        }
+    }
+
+    fun cancelSpotifyImport() {
+        spotifyImportJob?.cancel()
+        importUi = ImportUi.Idle
+        showToast("Import stopped")
+    }
+
     fun showToast(text: String, action: ToastAction? = null) {
         toast = text
         toastAction = action
@@ -1117,12 +1642,49 @@ class Controller(
 
     // ---------------- lifecycle ----------------
 
+    /** Looks for a newer release (on start; [manual] from the top bar button also says when there is none). */
+    fun checkForUpdates(manual: Boolean = false) {
+        scope.launch(Dispatchers.IO) {
+            val found = runCatching { AppHooks.updates?.check() }.onFailure { AppHooks.log("Update check failed: ${it.message?.take(120)}") }.getOrNull()
+            if (found != null) { update = found; updateDialogOpen = true }
+            else if (manual) showToast("You're up to date (version ${(AppHooks.updates?.currentVersion() ?: "")})")
+        }
+    }
+
+    /** Downloads the installer, checks it, starts it and closes the app. */
+    fun installUpdate() {
+        val info = update ?: return
+        if (updateProgress != null) return
+        updateError = null; updateProgress = 0f
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                val updates = AppHooks.updates ?: error("Updates are not available here")
+                updateStage = "Downloading…"
+                val file = updates.download(info) { updateProgress = it }
+                AppHooks.log("Update ${info.version} downloaded from ${info.repo}; starting the installer.")
+                val silent = updates.installsSilently(info)
+                if (silent) updateStage = "Installing… W's MUSIC closes for a few seconds and reopens by itself."
+                updates.launchInstaller(file)
+                if (silent) delay(1800) // time to read it before the window closes
+            }.onSuccess {
+                updateProgress = null
+                requestExit?.invoke()
+            }.onFailure {
+                AppHooks.log("Update ${info.version} failed: ${it.message?.take(160)}")
+                updateProgress = null
+                updateStage = null
+                updateError = it.message?.take(140) ?: "The update could not be downloaded"
+            }
+        }
+    }
+
     /** Warms up the stream resolver so the first song starts sooner. */
     fun warmUp() {
         scope.launch(Dispatchers.IO) {
+            runCatching { AppHooks.updates?.lastUpdateResult() }.getOrNull()?.let { scope.launch { delay(1500); showToast(it) } }
             runCatching { if (YouTube.visitorData == null) YouTube.visitorData().onSuccess { YouTube.visitorData = it } }
             loadHome() // the feed no longer waits for the stream resolver warm-up
-            delay(Device.backgroundDelayMs) // keep the first seconds light; this only shortens the first song's start
+            delay(AppHooks.backgroundDelayMs) // keep the first seconds light; this only shortens the first song's start
             InnerTubeXStream.prewarm()
             refreshMixes()
         }
@@ -1130,7 +1692,9 @@ class Controller(
 
     /** Saves the last listen and settings; called when the window closes. */
     fun shutdown() {
-        val song = playingSong; val ms = playedMax
+        sync.stop()
+        runCatching { voiceMeter?.close() }
+        val song = playingSong; val ms = (playedMax - resumeBaseMs).coerceAtLeast(0)
         val duration = playback.durationMs.takeIf { it > 0 } ?: ((song?.duration ?: 0) * 1000L)
         if (song != null) runBlocking {
             runCatching {
@@ -1138,7 +1702,44 @@ class Controller(
                 if (ms > 0) library.recordSignal(song, ms, duration, playStartReason, EndReason.CLOSED, playContext)
             }
         }
+        queueStore?.save(::snapshotQueue)
         saveSettings()
+    }
+
+    // ---------------- persistent queue ----------------
+
+    /** The queue, the spot in the current song and where it came from, as it is right now. */
+    private fun snapshotQueue(): SavedQueue {
+        val q = queue
+        val duration = playback.durationMs.takeIf { it > 0 } ?: ((q.current?.duration ?: 0) * 1000L)
+        // A finished song (or one about to finish) comes back from the start rather than its last second.
+        val pos = positionMs.takeIf { duration <= 0 || it < duration - 5_000 } ?: 0L
+        return SavedQueue(
+            items = q.items, index = q.index, positionMs = pos, durationMs = duration,
+            context = queueContext, recommended = q.recommended,
+            radioIds = radioIds.filterTo(HashSet()) { id -> q.items.any { it.id == id } },
+            original = queueOriginal,
+        )
+    }
+
+    private fun persistQueueSoon() {
+        val store = queueStore ?: return
+        scope.launch(Dispatchers.IO) { store.save(::snapshotQueue) }
+    }
+
+    /** Puts back the queue from the last run: the song shows in the player bar, paused where it was left. */
+    private fun restoreQueue() {
+        val saved = queueStore?.load() ?: return
+        queueContext = saved.context
+        queueOriginal = saved.original.ifEmpty { saved.items }
+        radioIds += saved.radioIds
+        queue = queue.copy(items = saved.items, index = saved.index, recommended = saved.recommended)
+        val song = queue.current ?: return
+        val duration = saved.durationMs.takeIf { it > 0 } ?: ((song.duration ?: 0) * 1000L)
+        playback = PlayerState(durationMs = duration)
+        positionMs = saved.positionMs.coerceAtMost((duration - 1_000).coerceAtLeast(0))
+        resumePending = true
+        loadSideEffects(song) // lyrics and the album-art accent are ready before you press play
     }
 
     private fun loadSettings() {
@@ -1147,6 +1748,7 @@ class Controller(
             val p = Properties().apply { f.inputStream().use(::load) }
             p.getProperty("volume")?.toFloatOrNull()?.let { volume = it.coerceIn(0f, 1f) }
             p.getProperty("autoplay")?.let { autoplay = it.toBoolean() }
+            p.getProperty("voiceDuck")?.let { v -> voiceDuck = VoiceDuck.entries.firstOrNull { it.name == v } ?: VoiceDuck.OFF }
             p.getProperty("panelOpen")?.let { panelOpen = it.toBoolean() }
             p.getProperty("repeat")?.let { r -> RepeatMode.entries.firstOrNull { it.name == r }?.let { queue = queue.copy(repeat = it) } }
             p.getProperty("panelTab")?.let { t -> PanelTab.entries.firstOrNull { it.name == t }?.let { panelTab = it } }
@@ -1165,6 +1767,7 @@ class Controller(
             f.parentFile?.mkdirs()
             Properties().apply {
                 setProperty("volume", volume.toString()); setProperty("autoplay", autoplay.toString())
+                setProperty("voiceDuck", voiceDuck.name)
                 setProperty("panelOpen", panelOpen.toString()); setProperty("repeat", queue.repeat.name)
                 setProperty("panelTab", panelTab.name)
                 setProperty("sidebarWidth", sidebarWidth.toString()); setProperty("sidebarCollapsed", sidebarCollapsed.toString())
@@ -1174,3 +1777,8 @@ class Controller(
         }
     }
 }
+
+/** Discord's sound above this (peak, 0..1) means someone is talking; silence there is exactly 0. */
+private const val VOICE_THRESHOLD = 0.01f
+/** Music volume while someone talks, in "lower" mode. */
+private const val DUCKED_VOLUME = 0.2f

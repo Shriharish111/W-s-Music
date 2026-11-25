@@ -214,7 +214,7 @@ class NewUserTest {
     // ------------------------------------------------------------ screens
 
     private fun ui(t: Setup, block: androidx.compose.ui.test.DesktopComposeUiTest.() -> Unit) =
-        runDesktopComposeUiTest(width = 1340, height = 1700, testTimeout = 4.minutes) {
+        runDesktopComposeUiTest(width = 1340, height = 3600, testTimeout = 4.minutes) {
             setContent { WsTheme(t.c.accent) { AppContent(t.c, onPickAndroidFile = {}) } }
             block()
             t.close()

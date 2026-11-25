@@ -38,6 +38,9 @@ fun Song.toSongItem(): SongItem =
 class LibraryRepository(private val db: LibraryDatabase) {
     private val dao = db.dao()
 
+    /** Direct table access for Wi-Fi sync (echopc.sync), which reads and writes below the usual operations. */
+    val syncDao: LibraryDao get() = dao
+
     // Room returns a song's artists in arbitrary order; restore the stored `position` order.
     private suspend fun List<Song>.withArtistOrder(): List<Song> {
         if (isEmpty()) return this
@@ -50,6 +53,13 @@ class LibraryRepository(private val db: LibraryDatabase) {
 
     val likedSongs: Flow<List<Song>> = dao.likedSongs().map { it.withArtistOrder() }
     val likedIds: Flow<List<String>> = dao.likedIds()
+    /** Songs saved for offline listening, newest first. */
+    val downloadedSongs: Flow<List<Song>> = dao.downloadedSongs().map { it.withArtistOrder() }
+
+    suspend fun setDownloaded(item: SongItem, downloaded: Boolean) {
+        save(item)
+        dao.setDownloaded(item.id, downloaded, if (downloaded) LocalDateTime.now() else null)
+    }
     val librarySongs: Flow<List<Song>> = dao.librarySongs().map { it.withArtistOrder() }
     val playlists: Flow<List<Playlist>> = dao.playlists()
     fun history(limit: Int = 200): Flow<List<EventWithSong>> =
@@ -96,6 +106,14 @@ class LibraryRepository(private val db: LibraryDatabase) {
                 inLibrary = if (!song.liked) song.inLibrary ?: now else song.inLibrary,
             ),
         )
+    }
+
+    /** Marks the song as liked (does nothing if it already is; [toggleLike] would un-like it). */
+    suspend fun like(item: SongItem) {
+        val song = save(item)
+        if (song.liked) return
+        val now = LocalDateTime.now()
+        dao.update(song.copy(liked = true, likedDate = now, inLibrary = song.inLibrary ?: now))
     }
 
     suspend fun addToLibrary(item: SongItem) {

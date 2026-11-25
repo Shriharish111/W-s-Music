@@ -9,12 +9,15 @@ kotlin { jvmToolchain(21) }
 
 dependencies {
     implementation(project(":innertube"))
+    implementation(project(":stream"))
+    implementation(project(":shared"))
     implementation(project(":librarydb"))
     implementation(project(":lrclib"))
     implementation(project(":kugou"))
     implementation(project(":betterlyrics"))
     implementation(project(":simpmusic"))
     implementation(project(":youlyplus"))
+    implementation("net.jthink:jaudiotagger:3.0.1") // titles, artists and cover art of music files on this PC
     implementation("com.atilika.kuromoji:kuromoji-ipadic:0.9.0")
     implementation("com.github.promeG:tinypinyin:2.0.3")
     implementation("com.github.MetrolistGroup.innertubex:innertubex:0.7.2")
@@ -25,7 +28,7 @@ dependencies {
     implementation(compose.material3)
     implementation("org.jetbrains.compose.material:material-icons-extended:1.7.3")
     implementation("com.tianscar.javasound:jaad:0.9.4") // pure-Java AAC decoder for the compatible audio engine
-    implementation("net.java.dev.jna:jna-platform:5.14.0") // dark Windows title bar
+    implementation("net.java.dev.jna:jna-platform:5.14.0") // dark Windows title bar; audio meters for Discord mode
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
     // JavaFX Media for audio playback (AAC/m4a), no external player needed
     val fx = "21.0.5"
@@ -34,13 +37,21 @@ dependencies {
     for (m in listOf("base", "graphics", "media")) implementation("org.openjfx:javafx-$m:$fx:$plat")
 }
 
+// One place for the version: the installer, the Updater (version.properties) and the release tag must agree.
+val appVersion = "1.2.1"
+
+tasks.processResources {
+    inputs.property("appVersion", appVersion)
+    filesMatching("version.properties") { expand("appVersion" to appVersion) }
+}
+
 compose.desktop {
     application {
         mainClass = "echopc.MainKt"
         nativeDistributions {
             targetFormats(TargetFormat.Msi, TargetFormat.Exe)
             packageName = "WsMusic"
-            packageVersion = "1.0.0"
+            packageVersion = appVersion
             includeAllModules = true // keeps TLS (jdk.crypto.ec), java.net.http, sql etc. in the bundled runtime
             description = "W's MUSIC"
             vendor = "W"
@@ -48,6 +59,8 @@ compose.desktop {
                 menuGroup = "W's MUSIC"
                 shortcut = true
                 perUserInstall = true // installs into the user's profile: no administrator rights needed (school/work PCs)
+                // The id Windows uses to replace an installed version with a newer one (what earlier builds got by default).
+                upgradeUuid = "B797C31E-B15C-3AC1-8DDD-314B44040F14"
                 iconFile.set(project.file("icon.ico"))
             }
         }
@@ -85,6 +98,7 @@ dependencies {
 
 tasks.withType<Test> {
     systemProperty("wsmusic.nolog", "1")
+    forkEvery = 1 // each test class in its own JVM: UI tests share global state (Skiko, caches) and were disturbing each other
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true; exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
 }
 

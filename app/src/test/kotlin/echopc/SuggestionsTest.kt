@@ -32,8 +32,9 @@ class SuggestionsTest {
         c.navigate(Route.Search)
         setContent { WsTheme(c.accent) { AppContent(c, onPickAndroidFile = {}) } }
         waitForIdle() // the search box reports "not focused" once at start; set the typing state after that
+        c.searchFocusTick++ // focus the real search box, like Ctrl+L, so pressing a row really takes focus from it
+        waitUntil(timeoutMillis = 8_000L) { c.typing }
         c.query = "tame"
-        c.typing = true
         c.suggestions = SearchSuggestions(queries = listOf("tame impala dracula"), recommendedItems = listOf(artist, song))
         c.suggestionsFor = "tame"
 

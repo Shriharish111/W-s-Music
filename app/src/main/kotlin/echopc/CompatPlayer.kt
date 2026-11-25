@@ -40,7 +40,7 @@ class CompatPlayer(
         seekToMs = -1
         update { PlayerState(loading = true) }
         loader.retainOnly(setOfNotNull(videoId, nextVideoId))
-        val current = loader.load(videoId)
+        val current = loader.loadForPlay(videoId)
         playJob = scope.launch {
             try {
                 val file = current.await()

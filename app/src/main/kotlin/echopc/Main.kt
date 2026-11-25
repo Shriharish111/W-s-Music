@@ -43,6 +43,7 @@ fun settingsFile(): File {
 
 fun main() {
     Device.configure() // render API + audio engine must be chosen before any UI class loads
+    installDesktopHooks()
     runApp()
 }
 
@@ -57,7 +58,7 @@ private fun runApp() = application {
     }
     val controller = remember {
         LyricsRepository.store = library
-        Controller(scope, library, if (bench) null else settingsFile()) { onState, onEnded -> AdaptivePlayer(onState, onEnded) }.also { Trace.mark("controller created") }
+        Controller(scope, library, if (bench) null else settingsFile()) { onState, onEnded -> AdaptivePlayer(onState, onEnded) }.also { Trace.mark("controller created"); if (!bench) it.startSync() }
     }
     val shortcuts = remember { ShortcutHandler(controller) }
     val icon = remember { BitmapPainter(renderAppIcon(256).toComposeImageBitmap()) }
@@ -66,15 +67,18 @@ private fun runApp() = application {
     val startW = minOf(1340, usable.width - 40)
     val startH = minOf(840, usable.height - 40)
 
+    val closeApp: () -> Unit = {
+        controller.shutdown()
+        // Flow collectors keep querying; stop them before the database closes.
+        val job = scope.coroutineContext[kotlinx.coroutines.Job]
+        kotlinx.coroutines.runBlocking { job?.cancel(); job?.join() }
+        library.close()
+        exitApplication()
+    }
+    controller.requestExit = closeApp
+
     Window(
-        onCloseRequest = {
-            controller.shutdown()
-            // Flow collectors keep querying; stop them before the database closes.
-            val job = scope.coroutineContext[kotlinx.coroutines.Job]
-            kotlinx.coroutines.runBlocking { job?.cancel(); job?.join() }
-            library.close()
-            exitApplication()
-        },
+        onCloseRequest = closeApp,
         title = APP_NAME,
         icon = icon,
         state = rememberWindowState(size = DpSize(startW.dp, startH.dp), position = androidx.compose.ui.window.WindowPosition.Aligned(androidx.compose.ui.Alignment.Center)),
@@ -89,6 +93,7 @@ private fun runApp() = application {
             controller.warmUp()
             kotlinx.coroutines.delay(5_000)
             Device.launchSucceeded() // window survived the first seconds: the start counts as good
+            if (!bench && System.getenv("WSMUSIC_NOUPDATE") == null) { kotlinx.coroutines.delay(10_000); controller.checkForUpdates() }
             if (bench) {
                 controller.changeVolume(0f)
                 controller.search("daft punk get lucky")
@@ -104,6 +109,12 @@ private fun runApp() = application {
                 val name = dialog.file
                 val dir = dialog.directory
                 if (name != null && dir != null) controller.importAndroid(File(dir, name))
+            }, onPickSpotifyFile = {
+                val dialog = FileDialog(window, "Choose your Spotify data (my_spotify_data.zip, or a .json file from it)", FileDialog.LOAD)
+                dialog.isVisible = true
+                val name = dialog.file
+                val dir = dialog.directory
+                if (name != null && dir != null) controller.importSpotifyFile(name) { File(dir, name).readBytes() }
             })
         }
     }

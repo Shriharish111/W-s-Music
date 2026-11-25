@@ -1,0 +1,229 @@
+package echopc
+
+import io.ktor.client.request.get
+import io.ktor.client.request.header
+import io.ktor.client.statement.readRawBytes
+import java.io.OutputStream
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withTimeoutOrNull
+
+/** Where the loader reports stream problems; the desktop app points it at wsmusic.log. */
+object StreamLog {
+    @Volatile var sink: (String) -> Unit = {}
+    fun log(message: String) = sink(message)
+}
+
+/** Songs whose stream failed at least once and is being tried again, so the player can say so. */
+object StreamStatus {
+    val retrying = MutableStateFlow<Set<String>>(emptySet())
+}
+
+/** YouTube went quiet: no answer, or no audio data, for too long. */
+class StreamStalled(message: String) : Exception(message)
+
+/**
+ * Downloads a track's audio into a temp file. Results are cached per videoId so the next song
+ * can be fetched while the current one plays.
+ */
+/**
+ * Songs that are already on this device: downloads, and local music files (ids "local:<path>"). The apps set
+ * [find]; the loader then plays the file instead of streaming.
+ */
+object OfflineFiles {
+    @Volatile var find: (String) -> Path? = { null }
+    fun isLocal(id: String) = id.startsWith(LOCAL_PREFIX)
+    const val LOCAL_PREFIX = "local:"
+}
+
+/** A download that failed after the stream was resolved; remembers which client served it so the retry can use another. */
+class StreamFailure(val client: String?, cause: Throwable) : Exception(cause.message ?: cause.toString(), cause)
+
+class AudioLoader(
+    /** (videoId, clients to avoid, SABR allowed) -> stream. Replaced in tests. */
+    private val resolver: suspend (String, Set<String>, Boolean) -> ResolvedStream =
+        { id, skip, sabr -> InnerTubeXStream.resolve(id, requireM4a = true, allowSabr = sabr, skipClients = skip) },
+    /** Writes the stream into the file. Replaced in tests. */
+    private val downloadOverride: (suspend (ResolvedStream, Path) -> Unit)? = null,
+    private val retryDelayMs: Long = 500L,
+    /** How long finding the stream may take before the attempt counts as failed. */
+    private val resolveTimeoutMs: Long = 20_000L,
+    /** How long a download may go without receiving anything. */
+    private val stallTimeoutMs: Long = 20_000L,
+) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cache = ConcurrentHashMap<String, Deferred<Path>>()
+    private val struggling: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /**
+     * [load] for a song someone wants to hear now. An attempt that has already failed (and may be waiting a long
+     * while before the next try) is dropped for a fresh one; a download that is going well is reused.
+     */
+    fun loadForPlay(videoId: String): Deferred<Path> {
+        if (videoId in struggling) {
+            cache.remove(videoId)?.cancel()
+            markStruggling(videoId, false)
+        }
+        return load(videoId)
+    }
+
+    private fun markStruggling(videoId: String, on: Boolean) {
+        if (on) struggling += videoId else struggling -= videoId
+        StreamStatus.retrying.update { if (on) it + videoId else it - videoId }
+    }
+
+    /** Starts (or reuses) the download for [videoId]; a downloaded or local song is its file, right away. */
+    fun load(videoId: String): Deferred<Path> {
+        runCatching { OfflineFiles.find(videoId) }.getOrNull()?.takeIf { Files.isRegularFile(it) }?.let { return kotlinx.coroutines.CompletableDeferred(it) }
+        if (OfflineFiles.isLocal(videoId)) return kotlinx.coroutines.CompletableDeferred<Path>().apply { completeExceptionally(java.io.FileNotFoundException("This song's file is no longer on this device")) }
+        return stream(videoId)
+    }
+
+    /** Always from YouTube Music (used to download a song for offline). */
+    fun stream(videoId: String): Deferred<Path> =
+        cache.computeIfAbsent(videoId) {
+            scope.async {
+                var lastError: Throwable? = null
+                val skip = mutableSetOf<String>()
+                var protectedByYouTube = false // YouTube asked for attestation: every client fails the same way for a while
+                var attempt = 0
+                while (attempt < (if (protectedByYouTube) MAX_ATTEMPTS_BLOCKED else MAX_ATTEMPTS)) {
+                    try {
+                        // 1: normal. 2: avoid the client that just failed. 3-4: no SABR (plain ranged URLs), then any client again.
+                        // After an attestation block none of that helps, so keep the normal way and wait instead.
+                        if (attempt == 3) skip.clear()
+                        val path = fetch(videoId, skip, allowSabr = protectedByYouTube || attempt < 2)
+                        if (attempt > 0) StreamLog.log("Stream for $videoId recovered on attempt ${attempt + 1} (avoiding ${skip.ifEmpty { "nothing" }}).")
+                        markStruggling(videoId, false)
+                        return@async path
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        lastError = e
+                        val blocked = e.message?.contains("attestation", ignoreCase = true) == true
+                        if (blocked) protectedByYouTube = true else (e as? StreamFailure)?.client?.let { skip += it }
+                        val client = (e as? StreamFailure)?.client ?: "unknown client"
+                        val limit = if (protectedByYouTube) MAX_ATTEMPTS_BLOCKED else MAX_ATTEMPTS
+                        val msg = "Stream $videoId attempt ${attempt + 1}/$limit failed via $client: ${e.message?.take(200)}"
+                        println("[loader] $msg")
+                        StreamLog.log(msg)
+                        ensureActive() // dropped for a fresh attempt: don't mark the new one
+                        markStruggling(videoId, true)
+                        // An attestation block clears by itself after some seconds: wait 3, 6, 10, 15, 20, 25 s between tries.
+                        kotlinx.coroutines.delay(retryDelayMs * (if (blocked) BLOCK_WAITS[minOf(attempt, BLOCK_WAITS.lastIndex)] else (attempt + 1).toLong()))
+                    }
+                    attempt++
+                }
+                cache.remove(videoId)
+                markStruggling(videoId, false)
+                StreamLog.log("Stream $videoId gave up after $attempt attempts.")
+                throw lastError!!
+            }
+        }
+
+    /** Forgets [videoId]'s temp file (after it was moved elsewhere, e.g. into downloads). */
+    fun release(videoId: String) { cache.remove(videoId) }
+
+    /** One full attempt: resolve a fresh stream URL, then download it. */
+    private suspend fun fetch(videoId: String, skip: Set<String>, allowSabr: Boolean): Path {
+        val t0 = System.currentTimeMillis()
+        val stream = withTimeoutOrNull(resolveTimeoutMs) { resolver(videoId, skip, allowSabr) }
+            ?: throw StreamStalled("Stream search timed out after ${resolveTimeoutMs / 1000} s")
+        val t1 = System.currentTimeMillis()
+        val file = Files.createTempFile("echopc-", if (stream.mimeType.contains("webm")) ".webm" else ".m4a")
+        file.toFile().deleteOnExit()
+        try {
+            val override = downloadOverride
+            failIfSilent { received ->
+                if (override != null) {
+                    override(stream, file)
+                } else if (stream.sabr != null) {
+                    val bytes = Files.newOutputStream(file).use { out -> downloadSabrAudio(stream.sabr, ProgressStream(out, received)) }
+                    if (bytes == 0L) error("SABR stream returned no data (via ${stream.client})")
+                } else {
+                    downloadRanged(stream, file, received)
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            runCatching { Files.deleteIfExists(file) }
+            throw e
+        } catch (e: Throwable) {
+            runCatching { Files.deleteIfExists(file) }
+            throw StreamFailure(stream.client, e)
+        }
+        println("[loader] $videoId via ${stream.client}: resolve ${t1 - t0} ms, download ${System.currentTimeMillis() - t1} ms")
+        return file
+    }
+
+    /** Runs [download], which calls `received` as data arrives; gives up when nothing has arrived for too long. */
+    private suspend fun failIfSilent(download: suspend (received: () -> Unit) -> Unit) = coroutineScope {
+        val last = AtomicLong(System.nanoTime())
+        val work = async { download { last.set(System.nanoTime()) } }
+        while (!work.isCompleted) {
+            if ((System.nanoTime() - last.get()) / 1_000_000 > stallTimeoutMs) {
+                work.cancel()
+                throw StreamStalled("Stream timed out: no data for ${stallTimeoutMs / 1000} s")
+            }
+            withTimeoutOrNull(minOf(250L, stallTimeoutMs)) { work.join() }
+        }
+        work.await()
+    }
+
+    /** Drops cached files except those in [keep]. */
+    fun retainOnly(keep: Set<String>) {
+        for (id in cache.keys.toList()) {
+            if (id in keep) continue
+            val d = cache.remove(id) ?: continue
+            markStruggling(id, false)
+            if (d.isCompleted && !d.isCancelled) runCatching { Files.deleteIfExists(d.getCompleted()) } else d.cancel()
+        }
+    }
+
+    private suspend fun downloadRanged(stream: ResolvedStream, file: Path, received: () -> Unit) {
+        val chunk = 512 * 1024L
+        var start = 0L
+        var total = Long.MAX_VALUE
+        Files.newOutputStream(file).use { out ->
+            while (start < total) {
+                val response = InnerTubeXStream.httpClient.get(stream.url) {
+                    header("Range", "bytes=$start-${start + chunk - 1}")
+                    stream.headers.forEach { (k, v) -> if (!k.equals("Range", true) && !k.equals("Host", true)) header(k, v) }
+                }
+                val code = response.status.value
+                if (code == 416) break
+                if (code !in 200..299) error("Stream download failed at byte $start: HTTP $code (via ${stream.client})")
+                val body = response.readRawBytes()
+                out.write(body)
+                received()
+                start += body.size
+                val range = response.headers["Content-Range"]
+                if (range != null) total = range.substringAfter('/').toLongOrNull() ?: total
+                else if (code == 200) break
+                if (body.isEmpty()) break
+            }
+        }
+        if (start == 0L) error("Empty stream (via ${stream.client})")
+    }
+}
+
+/** Passes data through to [out] and reports that some arrived. */
+private class ProgressStream(private val out: OutputStream, private val received: () -> Unit) : OutputStream() {
+    override fun write(b: Int) { out.write(b); received() }
+    override fun write(b: ByteArray, off: Int, len: Int) { out.write(b, off, len); if (len > 0) received() }
+    override fun flush() = out.flush()
+}
+
+private const val MAX_ATTEMPTS = 4
+private const val MAX_ATTEMPTS_BLOCKED = 7 // when YouTube is blocking streams, keep trying for about a minute
+private val BLOCK_WAITS = longArrayOf(6, 12, 20, 30, 40, 50) // in units of the retry delay (500 ms)

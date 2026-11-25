@@ -40,6 +40,7 @@ class SearchTabsTest {
         )
         c.results = songs
         c.query = "alpha"
+        c.lastSearched = "alpha" // as after a real search; otherwise the page treats the text as still being typed
         c.navigate(Route.Search)
         setContent { WsTheme(c.accent) { AppContent(c, onPickAndroidFile = {}) } }
 

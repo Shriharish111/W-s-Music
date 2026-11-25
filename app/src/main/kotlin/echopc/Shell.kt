@@ -12,6 +12,10 @@ import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -33,6 +37,9 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Keyboard
+import androidx.compose.material.icons.rounded.LibraryMusic
+import androidx.compose.material.icons.rounded.Sync
+import androidx.compose.material.icons.rounded.SystemUpdateAlt
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -53,6 +60,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -67,6 +75,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.awt.Cursor
 
@@ -88,7 +97,7 @@ private fun Modifier.sideButtonNavigation(c: Controller): Modifier = pointerInpu
 }
 
 @Composable
-fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
+fun AppContent(c: Controller, onPickAndroidFile: () -> Unit, onPickSpotifyFile: () -> Unit = {}) {
     Box(Modifier.fillMaxSize().background(Ws.bg0).sideButtonNavigation(c)) {
         Column(Modifier.fillMaxSize()) {
             TopBar(c, onPickAndroidFile)
@@ -121,8 +130,13 @@ fun AppContent(c: Controller, onPickAndroidFile: () -> Unit) {
             }
         }
         if (c.shortcutsOpen) ShortcutsDialog { c.shortcutsOpen = false }
+        if (c.updateDialogOpen) UpdateDialog(c)
         if (c.newPlaylistOpen) NameDialog("New playlist", "", "Create", onConfirm = c::createPlaylist, onDismiss = { c.newPlaylistOpen = false; c.newPlaylistFor = null })
         ImportDialog(c)
+        if (c.spotifyImportOpen) SpotifyImportDialog(c, onPickSpotifyFile)
+        // A phone asking to pair opens the sync dialog so the code can be checked.
+        androidx.compose.runtime.LaunchedEffect(c.sync.pairRequest) { if (c.sync.pairRequest != null) c.syncOpen = true }
+        if (c.syncOpen) SyncDialog(c)
     }
 }
 
@@ -141,6 +155,8 @@ private fun MainView(c: Controller, modifier: Modifier) {
             is Route.Online -> OnlinePage(c, c.details[r.key])
             is Route.Mix -> MixPage(c, r.id)
             Route.Picker -> TastePickerPage(c)
+            Route.Downloads -> DownloadsPage(c)
+            Route.LocalFiles -> LocalFilesPage(c) { pickMusicFolder()?.let { DesktopLocalMusic.addFolder(it); c.scanLocalMusic() } }
         }
     }
 }
@@ -195,17 +211,29 @@ private fun TopBar(c: Controller, onPickAndroidFile: () -> Unit) {
             TopSearch(c)
         }
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End)) {
+            val pending = c.update
+            WsIconButton(
+                Icons.Rounded.SystemUpdateAlt, if (pending != null) "Update available: version ${pending.version}" else "Check for updates",
+                { if (pending != null) c.updateDialogOpen = true else c.checkForUpdates(manual = true) },
+                size = 32.dp, iconSize = 20.dp, tint = if (pending != null) LocalAccent.current.highlight else Ws.muted,
+            )
             WsIconButton(Icons.Rounded.Keyboard, "Keyboard shortcuts", { c.shortcutsOpen = true }, size = 32.dp, iconSize = 20.dp, shortcut = Shortcut.HELP.keys)
             WsIconButton(Icons.Rounded.FileUpload, "Import from the Android app", onPickAndroidFile, size = 32.dp, iconSize = 18.dp)
+            WsIconButton(Icons.Rounded.LibraryMusic, "Import from Spotify", { c.spotifyImportOpen = true }, size = 32.dp, iconSize = 18.dp)
+            WsIconButton(Icons.Rounded.Sync, "Sync with your phone", { c.syncOpen = true }, size = 32.dp, iconSize = 18.dp)
         }
     }
 }
 
-/** The W mark: fixed brand violet, not the album-art accent. */
+/** The W's MUSIC logo (a W on a vinyl record), white on black (from branding/). */
 @Composable
 private fun BrandMark() {
-    Box(Modifier.size(32.dp).clip(RoundedCornerShape(8.dp)).background(Ws.defaultAccent), contentAlignment = Alignment.Center) {
-        Text("W", style = MaterialTheme.typography.titleMedium.copy(fontFamily = BrandFont), color = Color.White)
+    val logo = remember {
+        Thread.currentThread().contextClassLoader?.getResourceAsStream("logo-mark.png")?.use { javax.imageio.ImageIO.read(it) }?.toComposeImageBitmap()
+    }
+    Box(Modifier.size(32.dp).clip(RoundedCornerShape(8.dp)).background(Color.Black), contentAlignment = Alignment.Center) {
+        if (logo != null) androidx.compose.foundation.Image(logo, "W's MUSIC", Modifier.size(26.dp))
+        else Text("W", style = MaterialTheme.typography.titleMedium.copy(fontFamily = BrandFont), color = Color.White)
     }
 }
 
@@ -245,6 +273,43 @@ private fun TopSearch(c: Controller) {
 // =====================================================================================
 //  Dialogs
 // =====================================================================================
+
+/** "A newer version is available": what it is, where it comes from, and one button to install it. */
+@Composable
+fun UpdateDialog(c: Controller) {
+    val info = c.update ?: return
+    val busy = c.updateProgress != null
+    AlertDialog(
+        onDismissRequest = { if (!busy) c.updateDialogOpen = false },
+        containerColor = Ws.surfaceHi, shape = RoundedCornerShape(8.dp),
+        title = { Text("Update available", style = MaterialTheme.typography.headlineMedium, color = Ws.text) },
+        text = { UpdateDialogBody(c, info) },
+        confirmButton = { PrimaryButton(if (c.updateError != null) "Try again" else "Update now", { c.installUpdate() }, enabled = !busy) },
+        dismissButton = { OutlineButton("Not now", { c.updateDialogOpen = false }, enabled = !busy) },
+    )
+}
+
+/** The words and progress bar of the update dialog (separate so it can be tested without opening a dialog window). */
+@Composable
+internal fun UpdateDialogBody(c: Controller, info: UpdateInfo) {
+    Column(Modifier.widthIn(min = 380.dp, max = 520.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Version ${info.version} is ready (you have ${Updater.currentVersion()}).", style = MaterialTheme.typography.bodyLarge, color = Ws.text)
+        if (info.notes.isNotBlank()) Text(plainReleaseNotes(info.notes).take(700), style = MaterialTheme.typography.bodyMedium, color = Ws.muted, maxLines = 12, overflow = TextOverflow.Ellipsis)
+        val silent = remember(info) { Updater.installsSilently(info) }
+        Text(
+            if (silent) "W's MUSIC downloads the update, closes for a few seconds while it installs, and reopens by itself. Your library, likes and settings are kept. From ${info.repo} on GitHub."
+            else "W's MUSIC closes, the installer opens, and your library, likes and settings are kept. From ${info.repo} on GitHub.",
+            style = MaterialTheme.typography.bodySmall, color = Ws.muted,
+        )
+        c.updateProgress?.let { p ->
+            val installing = c.updateStage?.startsWith("Installing") == true
+            if (installing) androidx.compose.material3.LinearProgressIndicator(Modifier.fillMaxWidth(), color = LocalAccent.current.highlight, trackColor = Ws.surfaceTop)
+            else androidx.compose.material3.LinearProgressIndicator(progress = { p }, Modifier.fillMaxWidth(), color = LocalAccent.current.highlight, trackColor = Ws.surfaceTop)
+            Text(if (installing) c.updateStage.orEmpty() else "Downloading… ${(p * 100).toInt()}%", style = MaterialTheme.typography.bodySmall, color = Ws.muted)
+        }
+        c.updateError?.let { Text("Update failed: $it", style = MaterialTheme.typography.bodyMedium, color = Ws.danger) }
+    }
+}
 
 /** All keyboard shortcuts, grouped, from the same table the key handling uses. */
 @Composable
@@ -298,6 +363,47 @@ fun ConfirmDialog(title: String, message: String, confirmLabel: String, onConfir
     )
 }
 
+/** Paste a Spotify playlist or album link, or choose the Spotify data download for everything (all playlists, likes, history). */
+@Composable
+private fun SpotifyImportDialog(c: Controller, onPickFile: () -> Unit) {
+    var link by remember { mutableStateOf("") }
+    var asLiked by remember { mutableStateOf(true) }
+    var name by remember { mutableStateOf("From Spotify") }
+    val songs = remember(link) { SpotifyLink.trackIds(link).size }
+    AlertDialog(
+        onDismissRequest = { c.spotifyImportOpen = false }, containerColor = Ws.surfaceHi, shape = RoundedCornerShape(8.dp),
+        title = { Text("Import from Spotify", style = MaterialTheme.typography.headlineMedium, color = Ws.text) },
+        text = {
+            Column(Modifier.widthIn(max = 560.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Liked Songs or a whole playlist: in the Spotify desktop app open it, click any song, press Ctrl+A then Ctrl+C, and paste here (Ctrl+V).",
+                    style = MaterialTheme.typography.bodyMedium, color = Ws.text)
+                Text("Or paste a playlist or album link (Share › Copy link; reads up to 100 songs).", style = MaterialTheme.typography.bodySmall, color = Ws.muted)
+                OutlinedTextField(link, { link = it }, Modifier.fillMaxWidth().heightIn(max = 120.dp), maxLines = 4, label = { Text("Paste here") }, shape = RoundedCornerShape(4.dp))
+                if (songs > 1 || (songs == 1 && SpotifyLink.parse(link)?.kind == "track")) {
+                    Text("$songs songs found. Add them to:", style = MaterialTheme.typography.titleSmall, color = Ws.text)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.RadioButton(asLiked, { asLiked = true })
+                        Text("Liked Songs", Modifier.clickable { asLiked = true }, color = Ws.text)
+                        Spacer(Modifier.width(16.dp))
+                        androidx.compose.material3.RadioButton(!asLiked, { asLiked = false })
+                        Text("A new playlist", Modifier.clickable { asLiked = false }, color = Ws.text)
+                    }
+                    if (!asLiked) OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Playlist name") }, shape = RoundedCornerShape(4.dp))
+                }
+                Text("Also possible: the data download from spotify.com (Account › Privacy settings › Download your data). \"Account data\" has all playlists and liked songs; \"Extended streaming history\" has only your plays.",
+                    style = MaterialTheme.typography.bodySmall, color = Ws.muted)
+                OutlineButton("Choose Spotify data file…", { c.spotifyImportOpen = false; onPickFile() })
+            }
+        },
+        confirmButton = {
+            PrimaryButton("Import", {
+                if (songs > 1 || (songs == 1 && SpotifyLink.parse(link)?.kind == "track")) c.importSpotifySongs(link, asLiked, name) else c.importSpotifyLink(link)
+            }, enabled = SpotifyLink.looksLikeLink(link))
+        },
+        dismissButton = { OutlineButton("Cancel", { c.spotifyImportOpen = false }) },
+    )
+}
+
 @Composable
 private fun ImportDialog(c: Controller) {
     when (val s = c.importUi) {
@@ -305,8 +411,14 @@ private fun ImportDialog(c: Controller) {
         is ImportUi.Running -> AlertDialog(
             onDismissRequest = {}, containerColor = Ws.surfaceHi, shape = RoundedCornerShape(8.dp),
             title = { Text("Importing", style = MaterialTheme.typography.headlineMedium, color = Ws.text) },
-            text = { Text("Reading ${s.fileName}. This takes a few seconds.", style = MaterialTheme.typography.bodyMedium, color = Ws.muted) },
-            confirmButton = {},
+            text = { Text(s.detail.ifEmpty { "Reading ${s.fileName}. This takes a few seconds." }, style = MaterialTheme.typography.bodyMedium, color = Ws.muted) },
+            confirmButton = { if (s.cancellable) OutlineButton("Stop", { c.cancelSpotifyImport() }) },
+        )
+        is ImportUi.Message -> AlertDialog(
+            onDismissRequest = { c.importUi = ImportUi.Idle }, containerColor = Ws.surfaceHi, shape = RoundedCornerShape(8.dp),
+            title = { Text(s.title, style = MaterialTheme.typography.headlineMedium, color = Ws.text) },
+            text = { Text(s.text, style = MaterialTheme.typography.bodyMedium, color = Ws.muted) },
+            confirmButton = { PrimaryButton("Done", { c.importUi = ImportUi.Idle }) },
         )
         is ImportUi.Done -> AlertDialog(
             onDismissRequest = { c.importUi = ImportUi.Idle }, containerColor = Ws.surfaceHi, shape = RoundedCornerShape(8.dp),

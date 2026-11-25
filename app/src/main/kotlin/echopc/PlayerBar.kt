@@ -2,6 +2,17 @@ package echopc
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.rounded.Bedtime
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -38,7 +49,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun PlayerBar(c: Controller) {
     val accent = LocalAccent.current
-    val song = c.queue.current
+    val song = c.nowQueue.current
     val has = song != null
     // The bar is at the bottom of the window: its tooltips open upward.
     CompositionLocalProvider(LocalTooltipAbove provides true) { Row(
@@ -55,11 +66,13 @@ fun PlayerBar(c: Controller) {
                         style = MaterialTheme.typography.titleSmall, color = Ws.text, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     )
                 }
-                val err = c.playback.error
+                val err = c.nowPlayback.error
                 when {
-                    err != null -> Text("Couldn't play this song: $err", style = MaterialTheme.typography.bodySmall, color = Ws.danger, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    err != null -> Text("Couldn't play this song: ${playbackErrorText(err)}", style = MaterialTheme.typography.bodySmall, color = Ws.danger, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    c.retryingNow -> Text("Retrying… press play to start over", style = MaterialTheme.typography.bodySmall, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     song != null -> Text(song.artists.joinToString { it.name }, style = MaterialTheme.typography.bodySmall, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
+                c.playingOn?.let { Text("Playing on $it", style = MaterialTheme.typography.labelSmall, color = accent.highlight, maxLines = 1, overflow = TextOverflow.Ellipsis) }
             }
             if (song != null) {
                 val liked = song.id in c.likedIds
@@ -68,6 +81,7 @@ fun PlayerBar(c: Controller) {
                     size = 32.dp, iconSize = 18.dp, tint = if (liked) accent.highlight else Ws.muted, hoverTint = if (liked) accent.primary else Ws.text,
                     shortcut = Shortcut.LIKE.keys,
                 )
+                SleepTimerButton(c)
             }
         }
 
@@ -75,16 +89,16 @@ fun PlayerBar(c: Controller) {
         Column(Modifier.weight(0.4f).widthIn(max = 720.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 val mode = c.shuffleMode()
-                ShuffleButton(mode, shuffleActionLabel(mode, c.smartAvailable(c.queueContext)), { c.cycleShuffle() }, enabled = c.queue.items.size > 1, shortcut = Shortcut.SHUFFLE.keys)
+                ShuffleButton(mode, shuffleActionLabel(mode, c.smartAvailable(c.queueContext)), { c.cycleShuffle() }, enabled = c.nowQueue.items.size > 1, shortcut = Shortcut.SHUFFLE.keys)
                 WsIconButton(Icons.Rounded.SkipPrevious, "Previous", { c.skipPrevious() }, enabled = has, size = 32.dp, iconSize = 24.dp, shortcut = Shortcut.PREVIOUS.keys)
-                PlayButton(c.playback.playing, c.playback.loading, has && c.playback.durationMs > 0 || c.playback.loading, { c.togglePause() }, size = 32.dp, shortcut = Shortcut.PLAY_PAUSE.keys)
+                PlayButton(c.nowPlayback.playing, c.nowPlayback.loading, has && (c.nowPlayback.durationMs > 0 || c.resumePending || c.nowPlayback.error != null) || c.nowPlayback.loading, { c.togglePause() }, size = 32.dp, shortcut = Shortcut.PLAY_PAUSE.keys)
                 WsIconButton(Icons.Rounded.SkipNext, "Next", { c.skipNext() }, enabled = has, size = 32.dp, iconSize = 24.dp, shortcut = Shortcut.NEXT.keys)
                 WsIconButton(
-                    if (c.queue.repeat == RepeatMode.ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
+                    if (c.nowQueue.repeat == RepeatMode.ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
                     // What a click does next, like the shuffle button.
-                    when (c.queue.repeat) { RepeatMode.OFF -> "Turn on repeat"; RepeatMode.ALL -> "Repeat this song"; RepeatMode.ONE -> "Turn off repeat" },
+                    when (c.nowQueue.repeat) { RepeatMode.OFF -> "Turn on repeat"; RepeatMode.ALL -> "Repeat this song"; RepeatMode.ONE -> "Turn off repeat" },
                     { c.cycleRepeat() }, size = 32.dp, iconSize = 18.dp,
-                    tint = if (c.queue.repeat == RepeatMode.OFF) Ws.muted else accent.highlight,
+                    tint = if (c.nowQueue.repeat == RepeatMode.OFF) Ws.muted else accent.highlight,
                     shortcut = Shortcut.REPEAT.keys,
                 )
             }
@@ -92,11 +106,11 @@ fun PlayerBar(c: Controller) {
                 // Only these two small widgets read the fast-changing position.
                 ElapsedLabel(c)
                 SeekBar(
-                    value = { if (c.playback.durationMs > 0) c.positionMs.toFloat() / c.playback.durationMs else 0f },
-                    onChange = {}, onChangeFinished = { c.seek((it * c.playback.durationMs).toLong()) },
-                    enabled = c.playback.durationMs > 0, modifier = Modifier.weight(1f),
+                    value = { if (c.nowPlayback.durationMs > 0) c.nowPositionMs.toFloat() / c.nowPlayback.durationMs else 0f },
+                    onChange = {}, onChangeFinished = { c.seek((it * c.nowPlayback.durationMs).toLong()) },
+                    enabled = c.nowPlayback.durationMs > 0, modifier = Modifier.weight(1f),
                 )
-                Text(fmtTime(c.playback.durationMs), style = MaterialTheme.typography.labelSmall, color = Ws.muted, modifier = Modifier.width(40.dp))
+                Text(fmtTime(c.nowPlayback.durationMs), style = MaterialTheme.typography.labelSmall, color = Ws.muted, modifier = Modifier.width(40.dp))
             }
         }
 
@@ -107,15 +121,38 @@ fun PlayerBar(c: Controller) {
             WsIconButton(Icons.Rounded.ViewSidebar, "Now playing view", { c.togglePanel(PanelTab.NOW_PLAYING) }, size = 32.dp, iconSize = 18.dp, tint = tintFor(c.panelOpen && c.panelTab == PanelTab.NOW_PLAYING))
             WsIconButton(Icons.Rounded.Lyrics, "Lyrics", { c.toggleLyrics() }, size = 32.dp, iconSize = 18.dp, tint = tintFor(c.route == Route.Lyrics), enabled = has)
             WsIconButton(Icons.Rounded.QueueMusic, "Queue", { c.togglePanel(PanelTab.QUEUE) }, size = 32.dp, iconSize = 18.dp, tint = tintFor(c.panelOpen && c.panelTab == PanelTab.QUEUE))
-            val volIcon = when { c.volume == 0f -> Icons.Rounded.VolumeOff; c.volume < 0.5f -> Icons.Rounded.VolumeDown; else -> Icons.Rounded.VolumeUp }
-            WsIconButton(volIcon, if (c.volume == 0f) "Unmute" else "Mute", { c.toggleMute() }, size = 32.dp, iconSize = 18.dp, shortcut = Shortcut.MUTE.keys)
-            SeekBar({ c.volume }, { c.changeVolume(it) }, Modifier.width(96.dp))
+            VoiceDuckButton(c)
+            DevicesButton(c)
+            val volIcon = when { c.nowVolume == 0f -> Icons.Rounded.VolumeOff; c.nowVolume < 0.5f -> Icons.Rounded.VolumeDown; else -> Icons.Rounded.VolumeUp }
+            WsIconButton(volIcon, if (c.nowVolume == 0f) "Unmute" else "Mute", { c.toggleMute() }, size = 32.dp, iconSize = 18.dp, shortcut = Shortcut.MUTE.keys)
+            SeekBar({ c.nowVolume }, { c.changeVolume(it) }, Modifier.width(96.dp))
         }
     } }
+}
+
+/** Moon button: pick when the music should pause by itself. */
+@Composable
+private fun SleepTimerButton(c: Controller) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        val until = c.sleepEndsAt
+        val label = when {
+            until != null -> "Sleep timer: pauses at " + java.time.format.DateTimeFormatter.ofLocalizedTime(java.time.format.FormatStyle.SHORT)
+                .format(java.time.Instant.ofEpochMilli(until).atZone(java.time.ZoneId.systemDefault()))
+            c.sleepAtSongEnd -> "Sleep timer: pauses after this song"
+            else -> "Sleep timer"
+        }
+        WsIconButton(Icons.Rounded.Bedtime, label, { open = true }, size = 32.dp, iconSize = 18.dp, tint = if (c.sleepTimerOn) LocalAccent.current.highlight else Ws.muted)
+        DropdownMenu(open, { open = false }, containerColor = Ws.surfaceTop, shape = RoundedCornerShape(4.dp)) {
+            listOf(5, 15, 30, 45, 60).forEach { m -> MenuItem("$m minutes", Icons.Rounded.Timer) { c.startSleepTimer(m); open = false } }
+            if (!c.remoteControlling) MenuItem("End of this song", Icons.Rounded.MusicNote) { c.sleepAfterSong(); open = false }
+            if (c.sleepTimerOn) MenuItem("Turn off timer", Icons.Rounded.Close) { c.cancelSleepTimer(); open = false }
+        }
+    }
 }
 
 /** Own composable so only this label (not the whole player bar) recomposes as time advances. */
 @Composable
 private fun ElapsedLabel(c: Controller) {
-    Text(fmtTime(c.positionMs), style = MaterialTheme.typography.labelSmall, color = Ws.muted, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
+    Text(fmtTime(c.nowPositionMs), style = MaterialTheme.typography.labelSmall, color = Ws.muted, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
 }
