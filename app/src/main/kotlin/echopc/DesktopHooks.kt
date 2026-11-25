@@ -3,6 +3,7 @@ package echopc
 /** Plugs the desktop's log file, album-art colours, lyrics and installer updates into the shared Controller. */
 fun installDesktopHooks() {
     AppHooks.log = Device::log
+    AppHooks.copyText = { java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(java.awt.datatransfer.StringSelection(it), null) }
     AppHooks.backgroundDelayMs = Device.backgroundDelayMs
     AppHooks.dominantColor = { url -> ThumbCache.load(url, 128)?.dominant }
     AppHooks.loadLyrics = { song -> LyricsRepository.load(song) }

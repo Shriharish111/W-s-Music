@@ -2,6 +2,17 @@ package echopc
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.rounded.Bedtime
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -58,6 +69,7 @@ fun PlayerBar(c: Controller) {
                 val err = c.nowPlayback.error
                 when {
                     err != null -> Text("Couldn't play this song: ${playbackErrorText(err)}", style = MaterialTheme.typography.bodySmall, color = Ws.danger, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    c.retryingNow -> Text("Retrying… press play to start over", style = MaterialTheme.typography.bodySmall, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     song != null -> Text(song.artists.joinToString { it.name }, style = MaterialTheme.typography.bodySmall, color = Ws.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 c.playingOn?.let { Text("Playing on $it", style = MaterialTheme.typography.labelSmall, color = accent.highlight, maxLines = 1, overflow = TextOverflow.Ellipsis) }
@@ -69,6 +81,7 @@ fun PlayerBar(c: Controller) {
                     size = 32.dp, iconSize = 18.dp, tint = if (liked) accent.highlight else Ws.muted, hoverTint = if (liked) accent.primary else Ws.text,
                     shortcut = Shortcut.LIKE.keys,
                 )
+                SleepTimerButton(c)
             }
         }
 
@@ -78,7 +91,7 @@ fun PlayerBar(c: Controller) {
                 val mode = c.shuffleMode()
                 ShuffleButton(mode, shuffleActionLabel(mode, c.smartAvailable(c.queueContext)), { c.cycleShuffle() }, enabled = c.nowQueue.items.size > 1, shortcut = Shortcut.SHUFFLE.keys)
                 WsIconButton(Icons.Rounded.SkipPrevious, "Previous", { c.skipPrevious() }, enabled = has, size = 32.dp, iconSize = 24.dp, shortcut = Shortcut.PREVIOUS.keys)
-                PlayButton(c.nowPlayback.playing, c.nowPlayback.loading, has && c.nowPlayback.durationMs > 0 || c.nowPlayback.loading, { c.togglePause() }, size = 32.dp, shortcut = Shortcut.PLAY_PAUSE.keys)
+                PlayButton(c.nowPlayback.playing, c.nowPlayback.loading, has && (c.nowPlayback.durationMs > 0 || c.resumePending || c.nowPlayback.error != null) || c.nowPlayback.loading, { c.togglePause() }, size = 32.dp, shortcut = Shortcut.PLAY_PAUSE.keys)
                 WsIconButton(Icons.Rounded.SkipNext, "Next", { c.skipNext() }, enabled = has, size = 32.dp, iconSize = 24.dp, shortcut = Shortcut.NEXT.keys)
                 WsIconButton(
                     if (c.nowQueue.repeat == RepeatMode.ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
@@ -115,6 +128,27 @@ fun PlayerBar(c: Controller) {
             SeekBar({ c.nowVolume }, { c.changeVolume(it) }, Modifier.width(96.dp))
         }
     } }
+}
+
+/** Moon button: pick when the music should pause by itself. */
+@Composable
+private fun SleepTimerButton(c: Controller) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        val until = c.sleepEndsAt
+        val label = when {
+            until != null -> "Sleep timer: pauses at " + java.time.format.DateTimeFormatter.ofLocalizedTime(java.time.format.FormatStyle.SHORT)
+                .format(java.time.Instant.ofEpochMilli(until).atZone(java.time.ZoneId.systemDefault()))
+            c.sleepAtSongEnd -> "Sleep timer: pauses after this song"
+            else -> "Sleep timer"
+        }
+        WsIconButton(Icons.Rounded.Bedtime, label, { open = true }, size = 32.dp, iconSize = 18.dp, tint = if (c.sleepTimerOn) LocalAccent.current.highlight else Ws.muted)
+        DropdownMenu(open, { open = false }, containerColor = Ws.surfaceTop, shape = RoundedCornerShape(4.dp)) {
+            listOf(5, 15, 30, 45, 60).forEach { m -> MenuItem("$m minutes", Icons.Rounded.Timer) { c.startSleepTimer(m); open = false } }
+            if (!c.remoteControlling) MenuItem("End of this song", Icons.Rounded.MusicNote) { c.sleepAfterSong(); open = false }
+            if (c.sleepTimerOn) MenuItem("Turn off timer", Icons.Rounded.Close) { c.cancelSleepTimer(); open = false }
+        }
+    }
 }
 
 /** Own composable so only this label (not the whole player bar) recomposes as time advances. */

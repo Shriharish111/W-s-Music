@@ -41,6 +41,8 @@ import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.ui.draw.alpha
 import echopc.db.artistKey
+import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -282,6 +284,8 @@ fun SongMenuItems(c: Controller, song: SongItem, context: String, close: () -> U
             else if (song.id !in c.downloads.active) MenuItem("Download", Icons.Rounded.Download) { c.downloads.download(listOf(song)); close() }
         }
         if (queueIndex != null && queueIndex != c.queue.index) MenuItem("Remove from queue", Icons.Rounded.Close) { c.removeFromQueue(queueIndex); close() }
+        MenuItem("Copy song link", Icons.Rounded.Link) { c.copyLink(song); close() }
+        MenuItem("Copy link for all platforms", Icons.Rounded.Share) { c.copyLink(song, allPlatforms = true); close() }
         HorizontalDivider(Modifier.padding(vertical = 4.dp), color = Ws.border)
         FeedbackItems(c, song, context, close)
     } else {

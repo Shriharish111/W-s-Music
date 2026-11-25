@@ -116,6 +116,7 @@ class AndroidEngine(
 
     override fun play(videoId: String, nextVideoId: String?) {
         Streams.loader.retainOnly(setOfNotNull(videoId, nextVideoId))
+        Streams.loader.loadForPlay(videoId)
         withPlayer { c ->
             currentId = videoId; nextId = nextVideoId; endedFor = null; error = null
             c.setMediaItem(item(videoId))

@@ -40,6 +40,8 @@ object AppHooks {
     @Volatile var backgroundDelayMs: Long = 4_000
     /** Dominant colour of a picture, for the accent behind the player; null when unknown. */
     @Volatile var dominantColor: suspend (url: String) -> Color? = { null }
+    /** Puts text on the clipboard; throws where the app hasn't plugged one in. */
+    @Volatile var copyText: (String) -> Unit = { error("No clipboard here") }
     /** Lyrics for a song. */
     @Volatile var loadLyrics: suspend (SongItem) -> LyricsUiState = { LyricsUiState.NotFound }
     /** Self-update; null where there is none. */

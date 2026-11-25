@@ -140,7 +140,7 @@ private fun MiniPlayer(c: Controller, onOpen: () -> Unit) {
                 Text(song.title, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Ws.text, style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold))
                 val err = c.nowPlayback.error
                 Text(
-                    when { err != null -> playbackErrorText(err); c.nowPlayback.loading -> "Loading…"; else -> song.artists.joinToString { it.name } },
+                    when { err != null -> playbackErrorText(err); c.nowPlayback.loading -> if (c.retryingNow) "Retrying…" else "Loading…"; else -> song.artists.joinToString { it.name } },
                     maxLines = 1, overflow = TextOverflow.Ellipsis, color = if (err != null) Ws.danger else Ws.muted, style = MaterialTheme.typography.bodySmall,
                 )
             }
@@ -210,7 +210,7 @@ private fun NowPlaying(c: Controller, onClose: () -> Unit) {
                 }
                 c.playingOn?.let { Text("Playing on $it", Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = accent.highlight) }
                 c.nowPlayback.error?.let { Text(playbackErrorText(it), Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = Ws.danger) }
-                if (c.nowPlayback.loading) Text("Loading…", Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = Ws.muted)
+                if (c.nowPlayback.loading) Text(if (c.retryingNow) "Retrying…" else "Loading…", Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = Ws.muted)
                 SectionTitle("Up next")
             }
             val items = c.nowQueue.items

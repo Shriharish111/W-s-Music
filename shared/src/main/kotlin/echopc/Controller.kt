@@ -389,7 +389,7 @@ class Controller(
     /** Where the current queue came from ("liked", "local:<id>", "mix:<id>", ...); radio additions are "radio". */
     var queueContext = "home"
         private set
-    private val radioIds = HashSet<String>()
+    private val radioIds: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
     /** Play logging: one worker runs the writes strictly in the order plays end. */
     private val playLog = kotlinx.coroutines.channels.Channel<suspend () -> Unit>(kotlinx.coroutines.channels.Channel.UNLIMITED)
     private var sideJob: Job? = null
@@ -406,8 +406,37 @@ class Controller(
     @Volatile private var pausedByVoice = false
     @Volatile private var lastVoiceAt = 0L
 
+    // ---- sleep timer ----
+    /** When the sleep timer will pause the music (epoch ms), or null. */
+    var sleepEndsAt by mutableStateOf<Long?>(null)
+        private set
+    /** Pause when the current song finishes. */
+    var sleepAtSongEnd by mutableStateOf(false)
+        private set
+    val sleepTimerOn: Boolean get() = sleepEndsAt != null || sleepAtSongEnd
+    private var sleepJob: Job? = null
+
+    /** Puts text on the clipboard (the app plugs in how); replaced in tests. */
+    var copyText: (String) -> Unit = { AppHooks.copyText(it) }
+
+    // ---- streams being retried ----
+    private var retryingIds by mutableStateOf<Set<String>>(emptySet())
+    /** The current song failed to load at least once and is being tried again. */
+    val retryingNow: Boolean get() = !remoteControlling && playback.loading && queue.current?.id in retryingIds
+
+    // ---- persistent queue: the last song comes back (paused) on the next launch ----
+    private val queueStore: QueueStore? = settingsFile?.let { QueueStore(File(it.parentFile, "queue.txt")) }
+    /** True while the queue was restored from the last run and its song hasn't been loaded into the engine yet. */
+    var resumePending by mutableStateOf(false)
+        private set
+    /** Where to jump once the engine has the song ready (-1: nowhere). */
+    private var resumeSeekMs = -1L
+    /** A resumed song started part-way in; that part doesn't count as listened. */
+    private var resumeBaseMs = 0L
+
     init {
         loadSettings()
+        restoreQueue()
         engine.setVolume(volume.toDouble())
         scope.launch { library.likedIds.collect { likedIds = it.toSet() } }
         scope.launch {
@@ -418,6 +447,7 @@ class Controller(
             }
         }
         scope.launch { library.tastePicks.collect { tastePicks = it } }
+        scope.launch { StreamStatus.retrying.collect { retryingIds = it } }
         scope.launch { library.feedback.collect { blocks = Blocks.from(it) } }
         scope.launch { loadShelfStats() }
         scope.launch(Dispatchers.IO) { for (write in playLog) runCatching { write() } }
@@ -433,6 +463,15 @@ class Controller(
                 listOf(queue.current?.id, queue.index, queue.items.size, playback.playing, playback.loading, playback.durationMs, volume, queue.repeat)
             }.collect { sync.remote.localChanged() }
         }
+        // Keep the saved queue fresh (also covers a crash or a forced close).
+        if (queueStore != null) scope.launch(Dispatchers.IO) {
+            var last: SavedQueue? = null
+            while (true) {
+                delay(15_000)
+                val now = snapshotQueue()
+                if (now != last) { queueStore.save(::snapshotQueue); last = now }
+            }
+        }
     }
 
     // ---------------- engine callbacks ----------------
@@ -441,13 +480,90 @@ class Controller(
         if (s.playing) lastPlayedAt = System.currentTimeMillis()
         if (pendingSeekMs > 0 && s.durationMs > 0 && !s.loading) { val to = pendingSeekMs; pendingSeekMs = 0; engine.seek(to); positionMs = to }
         if (pendingPause && s.playing) { pendingPause = false; engine.togglePause() }
+        if (resumeSeekMs >= 0 && s.error == null) {
+            // A resumed song: jump to where it was left as soon as the engine has it ready.
+            val f = s.copy(positionMs = 0); if (f != playback) playback = f
+            if (s.loading || !s.playing || s.durationMs <= 0) return
+            val to = resumeSeekMs.coerceAtMost((s.durationMs - 1_000).coerceAtLeast(0))
+            resumeSeekMs = -1
+            engine.seek(to)
+            positionMs = to; playedMax = to
+            return
+        }
+        resumeSeekMs = -1
         if (s.positionMs != positionMs) positionMs = s.positionMs
         if (s.positionMs > playedMax) playedMax = s.positionMs
         val flags = s.copy(positionMs = 0)
         if (flags != playback) { playback = flags; sync.remote.localChanged() }
     }
 
-    private fun onEnded() = skipNext(auto = true)
+    private fun onEnded() {
+        if (!sleepAtSongEnd) { skipNext(auto = true); return }
+        // Sleep timer: stop here, with the next song lined up (paused) for when you're back.
+        sleepAtSongEnd = false
+        flushPlay(EndReason.TRACK_DONE)
+        queue.nextIndex(auto = true)?.let { queue = queue.jump(it) }
+        holdAt(0)
+        showToast("Sleep timer: paused")
+    }
+
+    // ---------------- sleep timer ----------------
+
+    /** Pauses the music in [minutes], fading out over the last few seconds. */
+    fun startSleepTimer(minutes: Int, durationMs: Long = minutes * 60_000L) {
+        cancelSleepTimer()
+        sleepEndsAt = System.currentTimeMillis() + durationMs
+        sleepJob = scope.launch {
+            delay(durationMs)
+            pausedByVoice = false // voice chat must not start the music again
+            if (remoteControlling) {
+                if (nowPlayback.playing) controlRemote(RemoteCommand.simple("pause"))
+            } else if (playback.playing) {
+                for (step in 9 downTo 1) { engine.setVolume(volume * duckFactor * step / 10.0); delay(300) }
+                if (playback.playing) engine.togglePause()
+                engine.setVolume((volume * duckFactor).toDouble())
+            } else if (playback.loading) {
+                flushPlay(EndReason.CLOSED); holdAt(positionMs)
+            }
+            sleepEndsAt = null
+            showToast("Sleep timer: paused")
+        }
+        showToast("Music will pause in $minutes ${if (minutes == 1) "minute" else "minutes"}")
+    }
+
+    fun sleepAfterSong() {
+        cancelSleepTimer()
+        sleepAtSongEnd = true
+        showToast("Music will pause after this song")
+    }
+
+    fun cancelSleepTimer() {
+        if (sleepJob?.isActive == true) engine.setVolume((volume * duckFactor).toDouble()) // in case it was fading
+        sleepJob?.cancel(); sleepJob = null
+        sleepEndsAt = null; sleepAtSongEnd = false
+    }
+
+    /** Unloads the engine but keeps the current song in the bar, ready to play from [ms]. */
+    private fun holdAt(ms: Long) {
+        val song = queue.current ?: return
+        engine.stop()
+        resumeSeekMs = -1
+        playback = PlayerState(durationMs = (song.duration ?: 0) * 1000L)
+        positionMs = ms
+        resumePending = true
+        loadSideEffects(song)
+        persistQueueSoon()
+    }
+
+    // ---------------- sharing ----------------
+
+    /** Copies a link to [song]: YouTube Music's own, or a Song.link page that offers other platforms. */
+    fun copyLink(song: SongItem, allPlatforms: Boolean = false) {
+        val link = if (allPlatforms) "https://song.link/y/${song.id}" else "https://music.youtube.com/watch?v=${song.id}"
+        runCatching { copyText(link) }
+            .onSuccess { showToast("Link copied") }
+            .onFailure { showToast("Couldn't copy the link") }
+    }
 
     // ---------------- playback control ----------------
 
@@ -457,7 +573,7 @@ class Controller(
      */
     private fun flushPlay(endReason: String) {
         val song = playingSong ?: return
-        val ms = playedMax
+        val ms = (playedMax - resumeBaseMs).coerceAtLeast(0)
         val duration = playback.durationMs.takeIf { it > 0 } ?: ((song.duration ?: 0) * 1000L)
         val reason = if (playback.error != null) EndReason.ERROR else endReason
         val start = playStartReason; val context = playContext
@@ -474,8 +590,10 @@ class Controller(
     }
 
     /** Starts the queue's current song; [start] says why it starts, [ended] why the previous one stopped. */
-    fun startCurrent(start: String = StartReason.CLICK_ROW, ended: String = EndReason.NEW_SELECTION, backwards: Boolean = false) {
+    fun startCurrent(start: String = StartReason.CLICK_ROW, ended: String = EndReason.NEW_SELECTION, backwards: Boolean = false, resumeAtMs: Long = 0) {
         if (queue.current == null) return
+        resumePending = false
+        resumeSeekMs = -1
         // Hidden songs and blocked artists are passed over, like Spotify does.
         val target = playableIndex(queue.index, backwards)
         if (target == null) {
@@ -489,11 +607,14 @@ class Controller(
         playingSong = song
         playStartReason = if (song.id in queue.recommended) StartReason.SMART_SHUFFLE else start
         playContext = if (song.id in radioIds) "radio" else queueContext
-        positionMs = 0
+        resumeBaseMs = resumeAtMs.coerceAtLeast(0)
+        resumeSeekMs = if (resumeAtMs > 0) resumeAtMs else -1
+        positionMs = resumeBaseMs
         engine.play(song.id, queue.upNext?.id)
         sync.remote.localChanged()
         if (queue.upNext == null && autoplay && !OfflineFiles.isLocal(song.id)) extendWithRadio(song, thenPlayFirstNew = false, ended = ended)
         loadSideEffects(song)
+        persistQueueSoon()
     }
 
     /** First playable position from [from], searching forward (or backward first for Previous). */
@@ -551,11 +672,12 @@ class Controller(
         queue.previousIndex()?.let { queue = queue.jump(it); startCurrent(StartReason.BACK_BUTTON, EndReason.BACK_BUTTON, backwards = true) }
     }
 
+    /** Play/pause. After a restart the restored song is only loaded now, from where it was left. */
     fun togglePause() {
         if (remoteControlling) { controlRemote(RemoteCommand.simple("toggle")); return }
         val resuming = !playback.playing
         pausedByVoice = false // the person decided; voice chat doesn't resume it
-        engine.togglePause()
+        localToggle()
         if (resuming) claimActive()
     }
 
@@ -602,7 +724,21 @@ class Controller(
         showToast("Volume ${(volume * 100).toInt()}%")
     }
     fun seek(ms: Long) { if (remoteControlling) controlRemote(RemoteCommand.seek(ms)) else localSeek(ms) }
-    private fun localSeek(ms: Long) { positionMs = ms; engine.seek(ms); sync.remote.localChanged() }
+    private fun localSeek(ms: Long) {
+        positionMs = ms
+        when {
+            resumePending -> {} // nothing loaded yet: play will start from here
+            resumeSeekMs >= 0 -> resumeSeekMs = ms.coerceAtLeast(0) // still loading the resumed song
+            else -> engine.seek(ms)
+        }
+        sync.remote.localChanged()
+    }
+
+    private fun localToggle() {
+        // A song that failed, or is stuck retrying, gets a fresh start: pausing it would do nothing.
+        if (resumePending || playback.error != null || retryingNow) startCurrent(StartReason.CLICK_ROW, EndReason.NEW_SELECTION, resumeAtMs = positionMs)
+        else engine.togglePause()
+    }
     fun changeVolume(v: Float) { if (remoteControlling) controlRemote(RemoteCommand.volume(v)) else localVolume(v) }
     private fun localVolume(v: Float) { volume = v; engine.setVolume((v * duckFactor).toDouble()); sync.remote.localChanged() }
 
@@ -724,6 +860,8 @@ class Controller(
     fun clearQueue() {
         flushPlay(EndReason.CLOSED); engine.stop(); queue = QueueState(); lyrics = LyricsUiState.Idle
         accent = Accent.DEFAULT
+        resumePending = false; resumeSeekMs = -1; playback = PlayerState(); positionMs = 0
+        persistQueueSoon()
     }
     // ---------------- shuffle & Smart Shuffle ----------------
 
@@ -974,8 +1112,8 @@ class Controller(
     override fun runRemote(command: kotlinx.serialization.json.JsonObject) {
         fun str(k: String) = (command[k] as? kotlinx.serialization.json.JsonPrimitive)?.content
         when (str("t")) {
-            "toggle" -> if (queue.current != null) engine.togglePause()
-            "play" -> if (!playback.playing && queue.current != null) engine.togglePause()
+            "toggle" -> if (queue.current != null) localToggle()
+            "play" -> if (!playback.playing && queue.current != null) localToggle()
             "pause" -> if (playback.playing) engine.togglePause()
             "next" -> localSkipNext(false)
             "prev" -> localSkipPrevious()
@@ -1556,7 +1694,7 @@ class Controller(
     fun shutdown() {
         sync.stop()
         runCatching { voiceMeter?.close() }
-        val song = playingSong; val ms = playedMax
+        val song = playingSong; val ms = (playedMax - resumeBaseMs).coerceAtLeast(0)
         val duration = playback.durationMs.takeIf { it > 0 } ?: ((song?.duration ?: 0) * 1000L)
         if (song != null) runBlocking {
             runCatching {
@@ -1564,7 +1702,44 @@ class Controller(
                 if (ms > 0) library.recordSignal(song, ms, duration, playStartReason, EndReason.CLOSED, playContext)
             }
         }
+        queueStore?.save(::snapshotQueue)
         saveSettings()
+    }
+
+    // ---------------- persistent queue ----------------
+
+    /** The queue, the spot in the current song and where it came from, as it is right now. */
+    private fun snapshotQueue(): SavedQueue {
+        val q = queue
+        val duration = playback.durationMs.takeIf { it > 0 } ?: ((q.current?.duration ?: 0) * 1000L)
+        // A finished song (or one about to finish) comes back from the start rather than its last second.
+        val pos = positionMs.takeIf { duration <= 0 || it < duration - 5_000 } ?: 0L
+        return SavedQueue(
+            items = q.items, index = q.index, positionMs = pos, durationMs = duration,
+            context = queueContext, recommended = q.recommended,
+            radioIds = radioIds.filterTo(HashSet()) { id -> q.items.any { it.id == id } },
+            original = queueOriginal,
+        )
+    }
+
+    private fun persistQueueSoon() {
+        val store = queueStore ?: return
+        scope.launch(Dispatchers.IO) { store.save(::snapshotQueue) }
+    }
+
+    /** Puts back the queue from the last run: the song shows in the player bar, paused where it was left. */
+    private fun restoreQueue() {
+        val saved = queueStore?.load() ?: return
+        queueContext = saved.context
+        queueOriginal = saved.original.ifEmpty { saved.items }
+        radioIds += saved.radioIds
+        queue = queue.copy(items = saved.items, index = saved.index, recommended = saved.recommended)
+        val song = queue.current ?: return
+        val duration = saved.durationMs.takeIf { it > 0 } ?: ((song.duration ?: 0) * 1000L)
+        playback = PlayerState(durationMs = duration)
+        positionMs = saved.positionMs.coerceAtMost((duration - 1_000).coerceAtLeast(0))
+        resumePending = true
+        loadSideEffects(song) // lyrics and the album-art accent are ready before you press play
     }
 
     private fun loadSettings() {
