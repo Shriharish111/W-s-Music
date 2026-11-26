@@ -166,7 +166,7 @@ object Updater : UpdateService {
     override fun launchInstaller(file: Path) {
         val exe = appExe()
         if (!file.toString().endsWith(".msi", ignoreCase = true) || exe == null) {
-            ProcessBuilder(if (file.toString().endsWith(".msi", true)) listOf("msiexec", "/i", file.toString()) else listOf(file.toString())).start()
+            ProcessBuilder(installerCommand(file)).start()
             return
         }
         val dir = file.parent
@@ -182,8 +182,35 @@ object Updater : UpdateService {
             |Start-Process -FilePath ${q(exe)}
             |""".trimMargin())
         pendingFile().toFile().writeText("${file.fileName}|$dir")
-        ProcessBuilder("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", script.toString())
-            .redirectErrorStream(true).redirectOutput(dir.resolve("helper.log").toFile()).start()
+        val helper = listOf(systemProgram("WindowsPowerShell/v1.0/powershell.exe"), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", script.toString())
+        startHelperOrInstaller(
+            startHelper = { ProcessBuilder(helper).redirectErrorStream(true).redirectOutput(dir.resolve("helper.log").toFile()).start() },
+            startInstaller = {
+                runCatching { Files.deleteIfExists(pendingFile()) } // no helper will report a result
+                ProcessBuilder(installerCommand(file)).start()
+            },
+        )
+    }
+
+    /** The installer with its own window. */
+    private fun installerCommand(file: Path): List<String> =
+        if (file.toString().endsWith(".msi", ignoreCase = true)) listOf(systemProgram("msiexec.exe"), "/i", file.toString()) else listOf(file.toString())
+
+    /**
+     * A Windows program by its full path in System32: some PCs have a broken PATH, where starting it by name fails
+     * ("Cannot run program powershell.exe"). The bare name if it isn't there.
+     */
+    fun systemProgram(path: String, systemRoot: String? = System.getenv("SystemRoot")): String =
+        systemRoot?.let { java.io.File(it, "System32/$path") }?.takeIf { it.isFile }?.path ?: path.substringAfterLast('/')
+
+    /** The silent update needs PowerShell; where it can't be started (removed or blocked), the normal installer opens instead. */
+    fun startHelperOrInstaller(startHelper: () -> Unit, startInstaller: () -> Unit) {
+        try {
+            startHelper()
+        } catch (e: java.io.IOException) {
+            Device.log("Silent update can't start, opening the installer instead: ${e.message?.take(160)}")
+            startInstaller()
+        }
     }
 
     override fun installsSilently(info: UpdateInfo): Boolean = info.assetName.endsWith(".msi", ignoreCase = true) && appExe() != null

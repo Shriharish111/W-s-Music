@@ -124,4 +124,23 @@ class UpdaterTest {
         scope.stop()
         repo.close()
     }
+
+    @Test
+    fun windowsProgramsAreFoundWithoutThePath() {
+        val root = java.nio.file.Files.createTempDirectory("ws-sysroot").toFile()
+        val exe = java.io.File(root, "System32/WindowsPowerShell/v1.0/powershell.exe")
+        exe.parentFile.mkdirs(); exe.writeText("x")
+        kotlin.test.assertEquals(exe.path, Updater.systemProgram("WindowsPowerShell/v1.0/powershell.exe", root.path))
+        kotlin.test.assertEquals("msiexec.exe", Updater.systemProgram("msiexec.exe", root.path))
+        kotlin.test.assertEquals("powershell.exe", Updater.systemProgram("WindowsPowerShell/v1.0/powershell.exe", null))
+        root.deleteRecursively()
+    }
+
+    @Test
+    fun theInstallerOpensWhenPowerShellCannotStart() {
+        val started = mutableListOf<String>()
+        Updater.startHelperOrInstaller({ started += "helper" }, { started += "installer" })
+        Updater.startHelperOrInstaller({ throw java.io.IOException("CreateProcess error=2") }, { started += "installer" })
+        kotlin.test.assertEquals(listOf("helper", "installer"), started)
+    }
 }
